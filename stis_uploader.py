@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
+from playwright.sync_api import TimeoutError as PwTimeout
 
 # kde EXE skutečně leží
 EXE_DIR = Path(sys.argv[0]).resolve().parent
@@ -21,13 +22,58 @@ BOOT_FILES = [
 ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I–M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
-def wait_online_ready(page, log, timeout=20000):
-    sel = "input[name^='domaciHrac_'], input[name^='hostujiciHrac_'], select[name^='domaciHrac_'], select[name^='hostujiciHrac_']"
-    page.wait_for_selector(sel, timeout=timeout)
-    log("Inputs ready. Counts:",
-        "domaciHrac inputs =", page.locator("input[name^='domaciHrac_']").count(),
-        "hostujiciHrac inputs =", page.locator("input[name^='hostujiciHrac_']").count())
 
+
+def _log(msg):
+    # bezpecné logování do konzole i souboru (pokud máš vlastní log funkci, klidně ji zde použij)
+    try:
+        print(msg, flush=True)
+    except Exception:
+        pass
+        
+
+def wait_online_ready(page, timeout=20000):
+    # čekej na seznam zápasů + první pole pro sety
+    page.wait_for_selector("#zapis .event", state="visible", timeout=timeout)
+    page.wait_for_selector("#zapis .event input.zapas-set", state="visible", timeout=timeout)
+
+def _choose_player(page, cell_css:str, name:str, timeout=4000):
+    """Klikne do buňky hráče a vybere jej přes jQuery-UI autocomplete."""
+    name = (name or "").strip()
+    if not name:
+        return
+    page.click(cell_css, timeout=timeout)
+    # objeví se input s třídou ui-autocomplete-input (jQuery UI)
+    try:
+        inp = page.locator("input.ui-autocomplete-input")
+        inp.wait_for(state="visible", timeout=timeout)
+    except PwTimeout:
+        # fallback – vezmi poslední viditelný text input (autocomplete ho taky vytváří)
+        inp = page.locator("input[type='text']").filter(has_not=page.locator(".zapas-set")).last
+        inp.wait_for(state="visible", timeout=timeout)
+    inp.fill(name)
+    page.keyboard.press("Enter")
+    # malá pauza, aby se DOM přepsal
+    page.wait_for_timeout(150)
+
+def _fill_sets_in_event(event, sets):
+    # sets = (s1,s2,s3,s4,s5) – už převedené na "101/-101/''/čísla"
+    inputs = event.locator(".event-sety input.zapas-set")
+    for i, val in enumerate(sets, start=1):
+        if val is None:
+            continue
+        try:
+            inputs.nth(i-1).fill(str(val))
+        except Exception:
+            pass
+ def _map_wo(val):
+    v = (val or "").strip()
+    if v.upper() in ("WO 3:0", "3:0 WO", "3:0WO"):
+        return "101"
+    if v.upper() in ("WO 0:3", "0:3 WO", "0:3WO"):
+        return "-101"
+    return v
+     
 def dump_dom(page, xlsx_path, log, tag="online_dump"):
     html_path = Path(xlsx_path).with_suffix(f".{tag}.html")
     png_path  = Path(xlsx_path).with_suffix(f".{tag}.png")
@@ -131,40 +177,52 @@ def read_zdroj_data(xlsx_path):
 
     return {"double": double, "singles": singles}
 
-def fill_online_from_zdroj(page, data, log, xlsx_path=None):
-    """
-    Vyplní čtyřhru (index 0) a singly (indexy 2..) na online formuláři STIS.
-    xlsx_path je volitelný – když je, uloží se případný DOM dump vedle sešitu.
-    """
+def fill_online_from_zdroj(page, wb):
+    """Vyplní čtyřhry/dvouhry + sety z listu 'zdroj' do online formuláře."""
+    ws = wb["zdroj"]
 
-    # 1) čekej až se pole objeví
-    try:
-        wait_online_ready(page, log, timeout=20000)
-    except Exception:
-        log("Inputs se neobjevily do 20 s – dělám dump DOMu.")
-        try:
-            if xlsx_path:
-                dump_dom(page, xlsx_path, log)
-        except Exception as e:
-            log("Dump DOM selhal:", repr(e))
-        raise
+    _log("[online] čekám na formulář…")
+    wait_online_ready(page)
 
-    # 2) čtyřhra (index 0)
-    d = data["double"]
-    _fill_name(page, "domaciHrac",  0, d.get("home1"), log)
-    _fill_name(page, "domaciHrac2", 0, d.get("home2"), log)
-    _fill_name(page, "hostujiciHrac",  0, d.get("away1"), log)
-    _fill_name(page, "hostujiciHrac2", 0, d.get("away2"), log)
-    for i, v in enumerate(d.get("sets", []), start=1):
-        _fill_set(page, i, 0, v, log)
+    events = page.locator("#zapis .event")
+    count = events.count()
+    if count < 18:
+        _log(f"[online] Varování: nalezeno {count} řádků (čekáno 18). Pokračuji…")
 
-    # 3) singly (indexy 2..)
-    for m in data.get("singles", []):
-        idx = m["idx"]
-        _fill_name(page, "domaciHrac",   idx, m.get("home"), log)
-        _fill_name(page, "hostujiciHrac", idx, m.get("away"), log)
-        for i, v in enumerate(m.get("sets", []), start=1):
-            _fill_set(page, i, idx, v, log)
+    # --- 1) ČTYŘHRY ---
+    # c0: D2+D3 vs E2+E3, sety v řádku 3 (I..M)
+    # c1: D4+D5 vs E4+E5, sety v řádku 5
+    pairs = [
+        ("#c0 .player.domaci",  ws["D2"].value, "#c0 .player.domaci.hrac2", ws["D3"].value,
+         "#c0 .player.host",    ws["E2"].value, "#c0 .player.host.hrac2",   ws["E3"].value, 3),
+        ("#c1 .player.domaci",  ws["D4"].value, "#c1 .player.domaci.hrac2", ws["D5"].value,
+         "#c1 .player.host",    ws["E4"].value, "#c1 .player.host.hrac2",   ws["E5"].value, 5),
+    ]
+    for (d1_css, d1, d2_css, d2, h1_css, h1, h2_css, h2, row_idx) in pairs:
+        _choose_player(page, d1_css + " .player-name", d1)
+        _choose_player(page, d2_css + " .player-name", d2)
+        _choose_player(page, h1_css + " .player-name", h1)
+        _choose_player(page, h2_css + " .player-name", h2)
+        # sety
+        s = tuple(_map_wo(ws[f"{col}{row_idx}"].value) for col in ("I","J","K","L","M"))
+        _fill_sets_in_event(events.nth(0 if row_idx==3 else 1), s)
+
+    # --- 2) DVOUHRY d0..d15 (indexy 0..15) ---
+    # idx 2..17 → excel řádky 7..22, sloupce D/E a I..M
+    for idx in range(2, 18):
+        row = idx + 5   # 2→7 … 17→22
+        ev = events.nth(idx)
+        d_css = f"#d{idx-2} .player.domaci .player-name"
+        h_css = f"#d{idx-2} .player.host .player-name"
+        _choose_player(page, d_css, ws[f"D{row}"].value)
+        _choose_player(page, h_css, ws[f"E{row}"].value)
+        s = tuple(_map_wo(ws[f"{col}{row}"].value) for col in ("I","J","K","L","M"))
+        _fill_sets_in_event(ev, s)
+
+    _log("[online] Ukládám 'Uložit změny'…")
+    # dole i nahoře – vezmeme dolní
+    page.locator("input[name='ulozit']").last.click()
+    page.wait_for_timeout(600)
 
 def boot(msg: str):
     """Zapiš krátkou zprávu ještě před main() – přežije i selhání argparse."""
