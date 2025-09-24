@@ -188,15 +188,27 @@ def click_save_and_continue(page):
         return True
     return False
 
-def main():
-    ensure_pw_browsers()
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--excel", required=True)
-    ap.add_argument("--team", required=True)
-    ap.add_argument("--headed", action="store_true")  # okno viditelné
-    args = ap.parse_args()
 
-    login, pwd, team = read_excel_config(Path(args.excel), args.team)
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--xlsx", required=True, help="plná cesta k XLSX")
+    p.add_argument("--team", required=True, help="název družstva (setup/Teams sloupec Družstvo)")
+    return p.parse_args()
+
+def main():
+    args = parse_args()
+    xlsx_path = Path(args.xlsx).resolve()
+    if not xlsx_path.exists():
+        raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
+
+    # pro jistotu nastav pracovní složku na složku sešitu
+    os.chdir(xlsx_path.parent)
+
+    # zapiš do logu, co přesně čteme
+    with open(xlsx_path.with_suffix(".log"), "w", encoding="utf-8") as f:
+        f.write(f"Using workbook: {xlsx_path}\n")
+
+    login, pwd, team = read_excel_config(xlsx_path, args.team)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not args.headed)
