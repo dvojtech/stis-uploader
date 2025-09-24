@@ -6,14 +6,36 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 def ensure_pw_browsers():
-    # když běží z EXE (onefile), data jsou v sys._MEIPASS
-    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-        base = Path(sys._MEIPASS)
-    else:
-        base = Path(__file__).parent
-    browsers = base / "ms-playwright"
-    if browsers.is_dir():
-        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+    """Zajistí, že je stažený Chromium pro Playwright. Pokud chybí, stáhne ho.
+       Instalace jde do uživatelského profilu: %LOCALAPPDATA%\\ms-playwright
+    """
+    # kam Playwright standardně stahuje prohlížeče na Windows
+    default_store = Path(os.environ.get("LOCALAPPDATA", Path.home()))
+    default_store = default_store / "ms-playwright"
+    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(default_store))
+
+    # jednoduchá kontrola, zda už Chromium existuje
+    chromium_ok = False
+    if default_store.exists():
+        # hledáme chrome.exe uvnitř chromium-* složky
+        for p in default_store.glob("chromium-*/*/chrome.exe"):
+            if p.exists():
+                chromium_ok = True
+                break
+
+    if chromium_ok:
+        return  # hotovo, nic nestahujeme
+
+    # stáhni prohlížeče přes vestavěné CLI Playwrightu (funguje i v PyInstaller EXE)
+    try:
+        import playwright.__main__ as pw_cli
+        # ekvivalent: `playwright install chromium`
+        pw_cli.main(["install", "chromium"])
+    except SystemExit as e:
+        # CLI volá sys.exit(); exit code 0 je OK
+        code = getattr(e, "code", 0) or 0
+        if int(code) != 0:
+            raise
 
 def norm(x) -> str:
     s = "" if x is None else str(x)
