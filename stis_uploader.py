@@ -6,6 +6,18 @@ from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
+from datetime import datetime
+from pathlib import Path
+import os, traceback
+
+BOOTLOG = Path(os.environ.get("TEMP", str(Path.cwd()))) / "stis_boot.log"
+
+def boot(msg: str):
+    try:
+        with open(BOOTLOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    except Exception:
+        pass
 
 def make_logger(xlsx_path: Path):
     """Vrátí (log_fn, file_handle, log_path) – loguje s časovou značkou."""
@@ -349,3 +361,18 @@ def main():
         except Exception:
             pass
 
+if __name__ == "__main__":
+    try:
+        boot("starting EXE")
+        main()
+        boot("main() finished OK")
+    except SystemExit as e:
+        boot(f"SystemExit (argparse?): {e}")
+        raise
+    except Exception as e:
+        boot("CRASH: " + repr(e))
+        try:
+            boot(traceback.format_exc())
+        except Exception:
+            pass
+        raise
