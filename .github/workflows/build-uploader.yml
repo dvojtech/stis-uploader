@@ -13,6 +13,18 @@ jobs:
         with:
           python-version: '3.10'
 
+      # ✅ Syntax check – fail fast na chybě odsazení/syntaxe
+      - name: Syntax check (py_compile)
+        run: python -m py_compile stis_uploader.py
+
+      # (volitelné) stopni build, pokud jsou v souboru tabulátory
+      - name: Guard: no tabs in source (optional)
+        shell: pwsh
+        run: |
+          if (Select-String -Path stis_uploader.py -Pattern "`t") {
+            Write-Error "Tabs detected in stis_uploader.py – please convert to spaces."
+          }
+
       - name: Install deps
         run: |
           pip install --upgrade pip
@@ -26,7 +38,6 @@ jobs:
           Copy-Item -Recurse -Force $src ms-playwright
 
       - name: Build EXE
-        # PowerShell ↴ (bez ^ – vše v jednom řádku)
         run: pyinstaller --onefile --noconsole --name "stis-uploader" --collect-all playwright --add-data "ms-playwright;ms-playwright" stis_uploader.py
 
       - name: Upload artifact
