@@ -46,71 +46,90 @@ def get_setup_sheet(wb):
             return ws
     return wb.active
 
+def find_login_pwd(ws):
+    """Vrátí login/heslo. Nejprve z B1/B2, když chybí, zkusí popisky 'login' / 'heslo' v horní části listu."""
+    login = str(ws["B1"].value or "").strip()
+    pwd   = str(ws["B2"].value or "").strip()
+    if login and pwd:
+        return login, pwd
+
+    max_r = min(30, ws.max_row or 0)
+    max_c = min(20, ws.max_column or 0)
+    found_login = found_pwd = ""
+    for r in range(1, max_r + 1):
+        for c in range(1, max_c + 1):
+            v = norm(ws.cell(r, c).value or "")
+            if v == "login" and c + 1 <= (ws.max_column or 0):
+                found_login = str(ws.cell(r, c + 1).value or "").strip()
+            if v == "heslo" and c + 1 <= (ws.max_column or 0):
+                found_pwd = str(ws.cell(r, c + 1).value or "").strip()
+    return found_login, found_pwd
+
+
+def find_teams_header_anywhere(wb):
+    """
+    Projdi všechny listy a najdi první řádek, kde je hlavička tabulky Teams:
+      - obsahuje 'druzstvo' (ale ne 'id' / 'vedouci')
+      - a zároveň některý marker ID ('druzstvoid', 'druzstvoid', 'iddruzstva', 'id')
+    Vrací (sheet, hdr_row) nebo (None, None).
+    """
+    id_markers = ("druzstvoid", "druzstvoid", "iddruzstva", "id")
+    for ws in wb.worksheets:
+        max_r = min(60, ws.max_row or 0)
+        max_c = min(80, ws.max_column or 0)
+        for r in range(1, max_r + 1):
+            row_norm = [norm(ws.cell(r, c).value or "") for c in range(1, max_c + 1)]
+            has_name = any(("druzstvo" in v and "id" not in v and "vedouci" not in v) for v in row_norm)
+            has_id   = any(any(m in v for m in id_markers) for v in row_norm)
+            if has_name and has_id:
+                return ws, r
+    return None, None
 
 def read_excel_config(xlsx_path: Path, team_name: str):
     """
-    Načte login/heslo ze setup!B1:B2 a řádek družstva z tabulky Teams.
-    Hlavičku tabulky najde kdekoli v prvních ~30 řádcích (nezávisí na řádku 6)
-    a je tolerantní k diakritice/překlepům (DruzstvoID/Druzstvoid apod.).
+    Najde list s tabulkou Teams kdekoli v sešitu, přihlášení bere z B1/B2
+    (nebo z popisků 'login'/'heslo'), namapuje sloupce a vrátí login, heslo a dict týmu.
     """
     wb = load_workbook(xlsx_path, data_only=True)
-    setup = get_setup_sheet(wb)
 
-    # --- přihlašovací údaje ---
-    login = str(setup["B1"].value or "").strip()
-    pwd   = str(setup["B2"].value or "")
-    if not login or not pwd:
-        raise RuntimeError("Vyplň login/heslo v setup!B1:B2.")
-
-    # Pomocné normování řádku
-    def norm_row(r, max_c):
-        return [norm(setup.cell(r, c).value or "") for c in range(1, max_c + 1)]
-
-    max_r = min(30, setup.max_row)
-    max_c = min(60, setup.max_column)
-
-    # --- najdi řádek hlavičky ---
-    id_markers = ("druzstvoid", "druzstvoid", "iddruzstva", "id")  # podporované varianty
-    hdr_row = None
-    for r in range(1, max_r + 1):
-        rn = norm_row(r, max_c)
-        has_name = any(("druzstvo" in v and "id" not in v and "vedouci" not in v) for v in rn)
-        has_id   = any(any(m in v for m in id_markers) for v in rn)
-        if has_name and has_id:
-            hdr_row = r
-            break
-
-    if hdr_row is None:
-        # DEBUG: zapiš prvních pár řádků, jak je vidíme
+    # 1) Najdi list a řádek hlavičky Teams kdekoliv v sešitu
+    setup, hdr_row = find_teams_header_anywhere(wb)
+    if setup is None:
+        # diagnostika – co jsme nahoře viděli
         try:
             with open(Path(xlsx_path).with_suffix(".log"), "w", encoding="utf-8") as f:
                 f.write("Header not found. Top rows (normalized):\n")
-                for r in range(1, min(15, setup.max_row) + 1):
-                    f.write(f"R{r}: {norm_row(r, max_c)}\n")
+                for ws in wb.worksheets:
+                    f.write(f"[{ws.title}]\n")
+                    max_r = min(15, ws.max_row or 0)
+                    max_c = min(20, ws.max_column or 0)
+                    for r in range(1, max_r + 1):
+                        rn = [norm(ws.cell(r, c).value or "") for c in range(1, max_c + 1)]
+                        f.write(f"R{r}: {rn}\n")
         except Exception:
             pass
-        raise RuntimeError("V setup!Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
+        raise RuntimeError("V setup/Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
 
-    # --- namapuj sloupce podle nalezené hlavičky ---
+    # 2) Login a heslo (z nalezeného listu)
+    login, pwd = find_login_pwd(setup)
+    if not login or not pwd:
+        raise RuntimeError("Vyplň login/heslo (B1/B2, nebo vedle popisků 'login'/'heslo').")
+
+    # 3) Namapuj sloupce podle hlavičky
+    id_markers = ("druzstvoid", "druzstvoid", "iddruzstva", "id")
+    max_c = min(80, setup.max_column or 0)
     idx = {}
     for c in range(1, max_c + 1):
         h = norm(setup.cell(hdr_row, c).value or "")
 
-        # Družstvo (název)
         if ("druzstvo" in h) and ("id" not in h) and ("vedouci" not in h):
             idx["name"] = c
-
-        # ID družstva – přijmi více variant
-        if any(m in h for m in ("druzstvoid", "druzstvoid", "iddruzstva")) or h == "id":
+        if any(m in h for m in id_markers):
             idx["id"] = c
-
-        # Vedoucí domácích / hostů
         if "vedoucidomacich" in h or ("vedouci" in h and "host" not in h):
             idx["ved_dom"] = c
         if "vedoucihostu" in h or ("vedouci" in h and "host" in h):
             idx["ved_host"] = c
-
-        # Herna, začátek, konec
         if "herna" in h:
             idx["herna"] = c
         if "zacatekut" in h or "zacatek" in h:
@@ -119,22 +138,21 @@ def read_excel_config(xlsx_path: Path, team_name: str):
             idx["konec"] = c
 
     if "name" not in idx or "id" not in idx:
-        raise RuntimeError("V setup!Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
+        raise RuntimeError("V Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
 
-    # --- najdi zvolený tým pod hlavičkou ---
+    # 4) Najdi požadované družstvo pod hlavičkou
     team = None
     r = hdr_row + 1
-    while r <= setup.max_row:
-        nm_cell = setup.cell(r, idx["name"]).value
-        if nm_cell is None or str(nm_cell).strip() == "":
-            break  # konec tabulky
-        if str(nm_cell).strip().lower() == team_name.strip().lower():
+    while r <= (setup.max_row or 0):
+        nm = setup.cell(r, idx["name"]).value
+        if nm is None or str(nm).strip() == "":
+            break
+        if str(nm).strip().lower() == team_name.strip().lower():
             def getcol(key):
                 c = idx.get(key)
                 return setup.cell(r, c).value if c else None
-
             team = {
-                "name":    str(nm_cell).strip(),
+                "name":    str(nm).strip(),
                 "id":      str(getcol("id") or "").strip(),
                 "ved_dom": getcol("ved_dom"),
                 "ved_host":getcol("ved_host"),
@@ -146,14 +164,11 @@ def read_excel_config(xlsx_path: Path, team_name: str):
         r += 1
 
     if not team:
-        raise RuntimeError(f"Družstvo '{team_name}' nenalezeno v setup!Teams.")
+        raise RuntimeError(f"Družstvo '{team_name}' nenalezeno v Teams.")
     if not team["id"]:
-        raise RuntimeError("Prázdné DruzstvoID.")
+        raise RuntimeError("Prázdné DruzstvoID u zvoleného družstva.")
 
     return login, pwd, team
-
-
-
 
 def click_save_and_continue(page):
     sels = [
