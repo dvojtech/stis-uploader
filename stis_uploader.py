@@ -14,11 +14,15 @@ def ensure_pw_browsers():
     if browsers.is_dir():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
 
+def norm(x) -> str:
+    # převod libovolné hodnoty (None/int/float/str) na normalizovaný řetězec
+    s = "" if x is None else str(x)
+    s = s.strip().lower()
+    # odstraň diakritiku (jednoduchá mapa) a nealfanumerické znaky
+    repl = str.maketrans("áäčďéěíĺľňóôřŕšťúůýž", "aaacdeei lnoorrstuu yz")
+    s = s.translate(repl)
+    return re.sub(r"[^\w]", "", s)
 
-def norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    repl = str.maketrans("áčďéěíňóřšťúůýž", "acdeeinorstuuyz")
-    return re.sub(r"[^\w]", "", s.translate(repl))
 
 def as_time_txt(v):
     if v is None: return None
