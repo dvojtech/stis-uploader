@@ -1,5 +1,6 @@
 # stis_uploader.py
 import argparse, os, re, sys, time
+import unicodedata
 from pathlib import Path
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
@@ -15,13 +16,16 @@ def ensure_pw_browsers():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
 
 def norm(x) -> str:
-    # převod libovolné hodnoty (None/int/float/str) na normalizovaný řetězec
     s = "" if x is None else str(x)
     s = s.strip().lower()
-    # odstraň diakritiku (jednoduchá mapa) a nealfanumerické znaky
-    repl = str.maketrans("áäčďéěíĺľňóôřŕšťúůýž", "aaacdeei lnoorrstuu yz")
-    s = s.translate(repl)
-    return re.sub(r"[^\w]", "", s)
+    # odstraň diakritiku
+    s = "".join(ch for ch in unicodedata.normalize("NFD", s)
+                if unicodedata.category(ch) != "Mn")
+    # bez mezer a nealfanumerických znaků
+    s = re.sub(r"\s+", "", s)
+    s = re.sub(r"[^0-9a-z_]", "", s)
+    return s
+
 
 
 def as_time_txt(v):
