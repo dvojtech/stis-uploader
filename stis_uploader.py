@@ -132,11 +132,12 @@ def read_zdroj_data(xlsx_path):
     return {"double": double, "singles": singles}
 
 def fill_online_from_zdroj(page, data, log, xlsx_path):
+    """Vyplní čtyřhru (index 0) a singly (indexy 2..) na online formuláři STIS."""
     try:
         wait_online_ready(page, log, timeout=20000)
     except Exception:
         log("Inputs se neobjevily do 20 s – dělám dump DOMu.")
-        dump_dom(page, xlsx_path, log)
+        dump_dom(page, xlsx_path, log)   # ← potřebuje xlsx_path
         raise
 
     # čtyřhra (index 0)
@@ -155,6 +156,7 @@ def fill_online_from_zdroj(page, data, log, xlsx_path):
         _fill_name(page, "hostujiciHrac", idx, m["away"], log)
         for i, v in enumerate(m["sets"], start=1):
             _fill_set(page, i, idx, v, log)
+
 
 def boot(msg: str):
     """Zapiš krátkou zprávu ještě před main() – přežije i selhání argparse."""
