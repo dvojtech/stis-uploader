@@ -2,13 +2,39 @@
 import argparse, os, re, sys, time
 import unicodedata
 import traceback
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
-from datetime import datetime
-from pathlib import Path
-import os, traceback
+
+# kde EXE skutečně leží
+EXE_DIR = Path(sys.argv[0]).resolve().parent
+# kam určitě umíme zapsat
+TEMP_DIR = Path(os.environ.get("TEMP", str(EXE_DIR)))
+# cesty pro „boot“ log (zapisujeme na obě místa)
+BOOT_FILES = [
+    TEMP_DIR / "stis_boot.log",
+    EXE_DIR / "stis_boot.log",
+]
+
+def boot(msg: str):
+    """Zapiš krátkou zprávu ještě před main() – přežije i selhání argparse."""
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n"
+    for p in BOOT_FILES:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+
+def msgbox(text: str, title: str="stis-uploader"):
+    try:
+        ctypes.windll.user32.MessageBoxW(0, str(text), str(title), 0x40)  # MB_ICONINFORMATION
+    except Exception:
+        pass
+
 
 BOOTLOG = Path(os.environ.get("TEMP", str(Path.cwd()))) / "stis_boot.log"
 
@@ -476,3 +502,25 @@ def main():
             pass
 
         raise
+if __name__ == "__main__":
+    boot("=== EXE start ===")
+    try:
+        boot("argv: " + " ".join(sys.argv))
+        main()  # tvoje stávající main() – neměň
+        boot("main() finished OK")
+    except SystemExit as e:
+        boot(f"SystemExit (pravděpodobně argparse): code={getattr(e, 'code', None)}")
+        msgbox("Spuštění skončilo hned na začátku (špatné/neúplné argumenty?).\n" +
+               "Zkontroluj prosím volání z Excelu.\n" +
+               "V TEMP nebo vedle EXE je stis_boot.log s detaily.")
+        raise
+    except Exception as e:
+        boot("CRASH: " + repr(e))
+        try:
+            boot(traceback.format_exc())
+        except Exception:
+            pass
+        msgbox(f"Nastala chyba: {e}\nPodrobnosti jsou ve stis_boot.log.")
+        raise
+    finally:
+        boot("=== EXE end ===")
