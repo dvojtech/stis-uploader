@@ -6,13 +6,10 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 def ensure_pw_browsers():
-    """Zajistí stáhnuté prohlížeče pro Playwright (Chromium).
-       Funguje i z PyInstaller EXE – použijeme playwright.__main__ a sys.argv hack.
-    """
+    """Stáhne Chromium pro Playwright, pokud chybí (funguje i z PyInstaller EXE)."""
     default_store = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ms-playwright"
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(default_store))
 
-    # Je už Chromium stažené?
     chromium_ok = False
     if default_store.exists():
         for p in default_store.glob("chromium-*/*/chrome.exe"):
@@ -22,14 +19,14 @@ def ensure_pw_browsers():
     if chromium_ok:
         return
 
-    # Stáhni přes CLI: ekvivalent `playwright install chromium`
     import playwright.__main__ as pw_cli
-    old_argv = sys.argv[:]          # zapamatuj původní argv
+    old_argv = sys.argv[:]
     try:
         sys.argv = ["playwright", "install", "chromium"]
-        pw_cli.main()               # v binale verzi bere argumenty z sys.argv
+        pw_cli.main()   # bere argumenty z sys.argv
     finally:
         sys.argv = old_argv
+
 
 
 def norm(x) -> str:
@@ -209,15 +206,13 @@ def click_save_and_continue(page):
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--xlsx", required=True, help="plná cesta k XLSX")
-    p.add_argument("--team", required=True, help="název družstva (setup/Teams sloupec Družstvo)")
-
-    # headed/headless přepínače (vzájemně se vylučují), default = headed (viditelné okno)
+    p.add_argument("--team", required=True, help="název družstva (sloupec 'Družstvo')")
     g = p.add_mutually_exclusive_group()
-    g.add_argument("--headed",  dest="headed",  action="store_true",  help="spusť s viditelným prohlížečem")
-    g.add_argument("--headless", dest="headed", action="store_false", help="spusť bez UI (headless)")
-    p.set_defaults(headed=True)
-
+    g.add_argument("--headed",  dest="headed",  action="store_true",  help="viditelný prohlížeč")
+    g.add_argument("--headless", dest="headed", action="store_false", help="bez UI")
+    p.set_defaults(headed=True)  # výchozí = viditelné okno
     return p.parse_args()
+
 
 
 def main():
@@ -226,29 +221,25 @@ def main():
     if not xlsx_path.exists():
         raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
 
-    # pro jistotu nastav pracovní složku na složku sešitu
-    os.chdir(xlsx_path.parent)
+    # … (čtení Excelu atd.)
 
-    # zapiš do logu, co přesně čteme
-    with open(xlsx_path.with_suffix(".log"), "w", encoding="utf-8") as f:
-        f.write(f"Using workbook: {xlsx_path}\n")
+    headed = bool(getattr(args, "headed", True))
+    headless = not headed
 
-    login, pwd, team = read_excel_config(xlsx_path, args.team)
-
-with sync_playwright() as p:
-    ensure_pw_browsers()
-    try:
-        browser = p.chromium.launch(headless=not args.headed)
-    except Exception:
-        # fallback: použij nainstalovaný Chrome/Edge
+    with sync_playwright() as p:
+        ensure_pw_browsers()
+        # robustní launch: Chromium → Chrome → Edge
+        browser = None
         try:
-            browser = p.chromium.launch(channel="chrome", headless=not args.headed)
+            browser = p.chromium.launch(headless=headless)
         except Exception:
-            browser = p.chromium.launch(channel="msedge", headless=not args.headed)
+            try:
+                browser = p.chromium.launch(channel="chrome", headless=headless)
+            except Exception:
+                browser = p.chromium.launch(channel="msedge", headless=headless)
 
-
-        ctx = browser.new_context()
-        page = ctx.new_page()
+        context = browser.new_context()
+        page = context.new_page()
 
         # 1) login
         page.goto("https://registr.ping-pong.cz/htm/auth/login.php", wait_until="domcontentloaded")
