@@ -1,3 +1,4 @@
+# .github/workflows/build-uploader.yml
 name: build-uploader
 on:
   workflow_dispatch:
@@ -25,12 +26,8 @@ jobs:
           Copy-Item -Recurse -Force $src ms-playwright
 
       - name: Build EXE
-        run: |
-          pyinstaller --onefile --noconsole ^
-            --name stis-uploader ^
-            --collect-all playwright ^
-            --add-data "ms-playwright;ms-playwright" ^
-            stis_uploader.py
+        # PowerShell ↴ (bez ^ – vše v jednom řádku)
+        run: pyinstaller --onefile --noconsole --name "stis-uploader" --collect-all playwright --add-data "ms-playwright;ms-playwright" stis_uploader.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
