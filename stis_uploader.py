@@ -21,7 +21,29 @@ BOOT_FILES = [
 ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I–M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
+def wait_online_ready(page, log, timeout=20000):
+    sel = "input[name^='domaciHrac_'], input[name^='hostujiciHrac_'], select[name^='domaciHrac_'], select[name^='hostujiciHrac_']"
+    page.wait_for_selector(sel, timeout=timeout)
+    log("Inputs ready. Counts:",
+        "domaciHrac inputs =", page.locator("input[name^='domaciHrac_']").count(),
+        "hostujiciHrac inputs =", page.locator("input[name^='hostujiciHrac_']").count())
 
+def dump_dom(page, xlsx_path, log, tag="online_dump"):
+    html_path = Path(xlsx_path).with_suffix(f".{tag}.html")
+    png_path  = Path(xlsx_path).with_suffix(f".{tag}.png")
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        page.screenshot(path=str(png_path), full_page=True)
+        log(f"DOM dump → {html_path.name}, screenshot → {png_path.name}")
+    except Exception as e:
+        log("DOM dump failed:", repr(e))
+
+def cnt(page, css):  # krátká pomůcka do logu
+    try:
+        return page.locator(css).count()
+    except Exception:
+        return -1
 def map_wo(s):
     """mapování WO značek na STIS kódy, jinak vrací čistý text/číslo"""
     t = str(s or "").strip()
@@ -32,6 +54,50 @@ def map_wo(s):
     if t.upper() in ("WO 0:3", "WO 0:3", "WO0:3"):
         return "-101"
     return t
+def _input_or_select(page, base, idx):
+    """
+    Vrátí locator na input/select pro dané pole. Bere:
+      - exact: input[name='base_idx'] / select[name='base_idx']
+      - tolerantní: input[name^='base'][name$='_{idx}'] / select[...]
+    """
+    exact = f"[name='{base}_{idx}']"
+    loose = f"[name^='{base}'][name$='_{idx}']"
+    sel = f"input{exact}, select{exact}, input{loose}, select{loose}"
+    loc = page.locator(sel)
+    if loc.count():
+        return loc.first
+    return None
+
+def _fill_name(page, base, idx, value, log):
+    if not value:
+        return
+    loc = _input_or_select(page, base, idx)
+    if not loc:
+        log(f"✗ nenalezeno pole {base}_{idx}")
+        return
+    try:
+        tag = loc.evaluate("e => e.tagName.toLowerCase()")
+        if tag == "select":
+            loc.select_option(label=str(value))
+        else:
+            loc.fill(str(value))
+        log(f"✓ {base}_{idx} ← {value}")
+    except Exception as e:
+        log(f"✗ {base}_{idx} fill failed:", repr(e))
+
+def _fill_set(page, set_no, idx, value, log):
+    if not value: 
+        return
+    base = f"set{set_no}"
+    loc = _input_or_select(page, base, idx)
+    if not loc:
+        log(f"✗ nenalezeno pole {base}_{idx}")
+        return
+    try:
+        loc.fill(str(value))
+        log(f"✓ {base}_{idx} ← {value}")
+    except Exception as e:
+        log(f"✗ {base}_{idx} fill failed:", repr(e))
 
 def read_zdroj_data(xlsx_path):
     """Načte čtyřhru a singly z listu 'zdroj' – podle výše uvedených konstant."""
@@ -64,6 +130,31 @@ def read_zdroj_data(xlsx_path):
         row += 1
 
     return {"double": double, "singles": singles}
+
+def fill_online_from_zdroj(page, data, log, xlsx_path):
+    try:
+        wait_online_ready(page, log, timeout=20000)
+    except Exception:
+        log("Inputs se neobjevily do 20 s – dělám dump DOMu.")
+        dump_dom(page, xlsx_path, log)
+        raise
+
+    # čtyřhra (index 0)
+    d = data["double"]
+    _fill_name(page, "domaciHrac",  0, d["home1"], log)
+    _fill_name(page, "domaciHrac2", 0, d["home2"], log)
+    _fill_name(page, "hostujiciHrac",  0, d["away1"], log)
+    _fill_name(page, "hostujiciHrac2", 0, d["away2"], log)
+    for i, v in enumerate(d["sets"], start=1):
+        _fill_set(page, i, 0, v, log)
+
+    # singly (indexy 2..)
+    for m in data["singles"]:
+        idx = m["idx"]
+        _fill_name(page, "domaciHrac", idx, m["home"], log)
+        _fill_name(page, "hostujiciHrac", idx, m["away"], log)
+        for i, v in enumerate(m["sets"], start=1):
+            _fill_set(page, i, idx, v, log)
 
 def boot(msg: str):
     """Zapiš krátkou zprávu ještě před main() – přežije i selhání argparse."""
@@ -554,18 +645,19 @@ def main():
                 # fallback: aspoň počkat na nějaké textové inputy
                 page.wait_for_selector("input[type='text']", timeout=10000)
             log("Online formulář načten:", page.url)
-            # ... po logu: Online formulář načten: page.url
-            data = read_zdroj_data(xlsx_path)
-            fill_online_from_zdroj(page, data, log)
             
-            # volitelně uložit
+           # vyplň data
+            data = read_zdroj_data(xlsx_path)
+            fill_online_from_zdroj(page, data, log, xlsx_path)
+            
+            # volitelné uložení
             try:
-                page.get_by_role("button", name=re.compile(r"uložit\s*změny", re.I)).first.click(timeout=3000)
+                page.get_by_role("button", name=re.compile(r"uložit\s*změny", re.I)).first.click(timeout=4000)
                 log("Kliknuto na 'Uložit změny'.")
             except Exception as e:
-                log("'Uložit změny' nenalezeno / přeskočeno:", repr(e))
-
-
+                log("'Uložit změny' nenašlo/nekliklo:", repr(e))
+            
+            # ponech okno na vizuální kontrolu (pokud běží headed)
             
             # 9) vizuální dokončení
             if headed:
