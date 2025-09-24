@@ -1,11 +1,24 @@
 # stis_uploader.py
 import argparse, os, re, sys, time
 import unicodedata
+import traceback
+from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
-def ensure_pw_browsers():
+def make_logger(xlsx_path: Path):
+    """Vrátí (log_fn, file_handle, log_path) – loguje s časovou značkou."""
+    log_path = xlsx_path.with_suffix(".stislog.txt")
+    f = open(log_path, "a", encoding="utf-8")
+    def log(*parts):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        line = " ".join(str(p) for p in parts)
+        f.write(f"[{ts}] {line}\n")
+        f.flush()
+    return log, f, log_path
+
+def ensure_pw_browsers(log=None):
     """Stáhne Chromium pro Playwright, pokud chybí (funguje i z PyInstaller EXE)."""
     default_store = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ms-playwright"
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(default_store))
@@ -17,15 +30,19 @@ def ensure_pw_browsers():
                 chromium_ok = True
                 break
     if chromium_ok:
+        if log: log("Chromium already present in", default_store)
         return
 
+    if log: log("Chromium not found – starting Playwright install (can take minutes)…")
     import playwright.__main__ as pw_cli
     old_argv = sys.argv[:]
     try:
         sys.argv = ["playwright", "install", "chromium"]
-        pw_cli.main()   # bere argumenty z sys.argv
+        pw_cli.main()   # CLI bere argumenty z sys.argv
+        if log: log("Playwright install finished.")
     finally:
         sys.argv = old_argv
+
 
 
 
@@ -218,86 +235,117 @@ def parse_args():
 def main():
     args = parse_args()
     xlsx_path = Path(args.xlsx).resolve()
-    if not xlsx_path.exists():
-        raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
 
-    # --- načti přihlašovací údaje a družstvo z Excelu ---
-    user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
+    # zřídíme logger
+    log, log_file, log_path = make_logger(xlsx_path)
+    log("==== stis_uploader start ====")
+    log("XLSX:", xlsx_path)
+    log("Team:", args.team)
+    log("Headed:", getattr(args, "headed", True))
 
-    # --- režim prohlížeče ---
-    headed = bool(getattr(args, "headed", True))
-    headless = not headed
+    try:
+        if not xlsx_path.exists():
+            raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
 
-    with sync_playwright() as p:
-        ensure_pw_browsers()
+        # --- načti přihlašovací údaje a družstvo z Excelu ---
+        user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
+        log("Login OK, team:", team["name"], "ID:", team["id"])
 
-        # robustní launch: managed Chromium → Chrome → Edge
-        try:
-            browser = p.chromium.launch(headless=headless)
-        except Exception:
+        # --- režim prohlížeče ---
+        headed = bool(getattr(args, "headed", True))
+        headless = not headed
+
+        with sync_playwright() as p:
+            ensure_pw_browsers(log)
+
+            # robustní launch: managed Chromium → Chrome → Edge
+            log("Launching browser… headless =", headless)
             try:
-                browser = p.chromium.launch(channel="chrome", headless=headless)
-            except Exception:
-                browser = p.chromium.launch(channel="msedge", headless=headless)
-
-        context = browser.new_context()
-        page = context.new_page()
-
-        # 1) login
-        page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
-                  wait_until="domcontentloaded")
-        page.fill("input[name='login']", user_login)
-        page.fill("input[name='heslo']",  user_pwd)
-        page.locator("[name='send']").click()
-        page.wait_for_load_state("domcontentloaded")
-
-        # 2) stránka družstva podle ID
-        page.goto(
-            f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}",
-            wait_until="domcontentloaded"
-        )
-
-        # 3) vložit/upravit zápis
-        l = page.locator("a:has-text('vložit zápis')")
-        if not l.count():
-            l = page.locator("a:has-text('upravit zápis')")
-        l.first.click()
-        page.wait_for_load_state("domcontentloaded")
-
-        # 4) úvodní část – herna/začátek/vedoucí
-        if team.get("herna") and page.locator("input[name='zapis_herna']").count():
-            page.fill("input[name='zapis_herna']", str(team["herna"]))
-
-        if team.get("zacatek"):
-            if page.locator("input[name='zapis_zacatek']").count():
-                page.fill("input[name='zapis_zacatek']", team["zacatek"])
-            else:
+                browser = p.chromium.launch(headless=headless)
+            except Exception as e1:
+                log("Chromium launch failed:", repr(e1), " – trying channel=chrome")
                 try:
-                    hh, mm = team["zacatek"].split(":")
-                    sels = page.locator("select")
-                    if sels.count() >= 2:
-                        sels.nth(0).select_option(value=hh)
-                        sels.nth(1).select_option(value=mm)
-                except:
-                    pass
+                    browser = p.chromium.launch(channel="chrome", headless=headless)
+                except Exception as e2:
+                    log("Chrome launch failed:", repr(e2), " – trying channel=msedge")
+                    browser = p.chromium.launch(channel="msedge", headless=headless)
 
-        if team.get("ved_dom") and page.locator("select[name='id_domaci_vedouci']").count():
-            page.select_option("select[name='id_domaci_vedouci']", label=str(team["ved_dom"]))
-        if team.get("ved_host") and page.locator("select[name='id_hoste_vedouci']").count():
-            page.select_option("select[name='id_hoste_vedouci']", label=str(team["ved_host"]))
+            context = browser.new_context()
+            page = context.new_page()
 
-        # 5) Uložit a pokračovat → online formulář
-        if not click_save_and_continue(page):
-            raise RuntimeError("Nenašel jsem tlačítko 'Uložit a pokračovat'.")
-        page.wait_for_url(re.compile(r".*/online\.php\?u=\d+"), timeout=20000)
-        page.wait_for_selector("input[type='text']", timeout=10000)
+            # 1) login
+            log("Navigating to login…")
+            page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
+                      wait_until="domcontentloaded")
+            page.fill("input[name='login']", user_login)
+            page.fill("input[name='heslo']",  user_pwd)
+            page.locator("[name='send']").click()
+            page.wait_for_load_state("domcontentloaded")
+            log("Logged in.")
 
-        # nech okno otevřené pro vizuální dokončení
-        if headed:
-            print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
-            while True:
-                time.sleep(1)
-        else:
-            context.close()
-            browser.close()
+            # 2) stránka družstva podle ID
+            url_team = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
+            log("Open team page:", url_team)
+            page.goto(url_team, wait_until="domcontentloaded")
+
+            # 3) vložit/upravit zápis
+            log("Click 'vložit zápis' / 'upravit zápis'…")
+            l = page.locator("a:has-text('vložit zápis')")
+            if not l.count(): l = page.locator("a:has-text('upravit zápis')")
+            l.first.click()
+            page.wait_for_load_state("domcontentloaded")
+
+            # 4) úvodní část – herna/začátek/vedoucí
+            if team.get("herna") and page.locator("input[name='zapis_herna']").count():
+                page.fill("input[name='zapis_herna']", str(team["herna"]))
+            if team.get("zacatek"):
+                if page.locator("input[name='zapis_zacatek']").count():
+                    page.fill("input[name='zapis_zacatek']", team["zacatek"])
+                else:
+                    try:
+                        hh, mm = team["zacatek"].split(":")
+                        sels = page.locator("select")
+                        if sels.count() >= 2:
+                            sels.nth(0).select_option(value=hh)
+                            sels.nth(1).select_option(value=mm)
+                    except Exception as e:
+                        log("Set start time via selects failed:", repr(e))
+
+            if team.get("ved_dom") and page.locator("select[name='id_domaci_vedouci']").count():
+                page.select_option("select[name='id_domaci_vedouci']", label=str(team["ved_dom"]))
+            if team.get("ved_host") and page.locator("select[name='id_hoste_vedouci']").count():
+                page.select_option("select[name='id_hoste_vedouci']", label=str(team["ved_host"]))
+
+            # 5) Uložit a pokračovat → online formulář
+            log("Click 'Uložit a pokračovat'…")
+            if not click_save_and_continue(page):
+                raise RuntimeError("Nenašel jsem tlačítko 'Uložit a pokračovat'.")
+            page.wait_for_url(re.compile(r".*/online\.php\?u=\d+"), timeout=20000)
+            page.wait_for_selector("input[type='text']", timeout=10000)
+            log("Online formulář načten – připraveno k ručnímu dopsání výsledků.")
+
+            if headed:
+                log("Leaving browser open for manual finish.")
+                print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
+                while True:
+                    time.sleep(1)
+            else:
+                context.close()
+                browser.close()
+
+    except Exception as e:
+        # zapiš chybový stack a otevři log v Notepadu
+        log("ERROR:", repr(e))
+        log(traceback.format_exc())
+        try:
+            os.startfile(str(log_path))  # otevřít log v Notepadu (Windows)
+        except Exception:
+            pass
+        raise
+    finally:
+        try:
+            log("==== stis_uploader end ====")
+            log_file.close()
+        except Exception:
+            pass
 
