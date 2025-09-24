@@ -248,21 +248,6 @@ def _fill_sets(page, base_idx, sets, log):
         sel = f"input[name='set{i}_{base_idx}']"
         _safe_fill(page, sel, val, log)
 
-def fill_online_from_zdroj(page, data, log):
-    """Vyplní čtyřhru (index 0) a singly (indexy 2..)**/"""
-    d = data["double"]
-    _safe_fill(page, "input[name='domaciHrac_0']",  d["home1"], log)
-    _safe_fill(page, "input[name='domaciHrac2_0']", d["home2"], log)
-    _safe_fill(page, "input[name='hostujiciHrac_0']",  d["away1"], log)
-    _safe_fill(page, "input[name='hostujiciHrac2_0']", d["away2"], log)
-    _fill_sets(page, 0, d["sets"], log)
-
-    for m in data["singles"]:
-        idx = m["idx"]
-        _safe_fill(page, f"input[name='domaciHrac_{idx}']",   m["home"], log)
-        _safe_fill(page, f"input[name='hostujiciHrac_{idx}']", m["away"], log)
-        _fill_sets(page, idx, m["sets"], log)
-
 
 def norm(x) -> str:
     s = "" if x is None else str(x)
