@@ -32,33 +32,42 @@ def as_time_txt(v):
     return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
 
 def get_setup_sheet(wb):
-    # najdi list 'setup' case-insensitive, jinak první list
+    """Najdi list 'setup' case-insensitive, jinak vrať první list."""
     for ws in wb.worksheets:
         if (ws.title or "").strip().lower() == "setup":
             return ws
     return wb.active
 
+
 def read_excel_config(xlsx_path: Path, team_name: str):
+    """
+    Načte login/heslo ze setup!B1:B2 a řádek družstva z tabulky 'Teams'.
+    Hlavičku tabulky najde kdekoli v prvních ~30 řádcích (nezávisí na řádku 6)
+    a je tolerantní k diakritice/překlepům (DruzstvoID/Druzstvoid apod.).
+    """
     wb = load_workbook(xlsx_path, data_only=True)
     setup = get_setup_sheet(wb)
 
+    # --- přihlašovací údaje ---
     login = str(setup["B1"].value or "").strip()
     pwd   = str(setup["B2"].value or "")
     if not login or not pwd:
         raise RuntimeError("Vyplň login/heslo v setup!B1:B2.")
 
-    # --- vyhledej řádek hlavičky kdekoli v prvních 30 řádcích ---
-    def row_norm(r, max_c):
+    # --- pomocné: načti a normalizuj řádek buněk ---
+    def norm_row(r, max_c):
         return [norm(setup.cell(r, c).value or "") for c in range(1, max_c + 1)]
 
     max_r = min(30, setup.max_row)
-    max_c = min(50, setup.max_column)
+    max_c = min(60, setup.max_column)
+
+    # --- najdi řádek hlavičky: musí obsahovat jméno družstva i ID ---
     hdr_row = None
     for r in range(1, max_r + 1):
-        rn = row_norm(r, max_c)
-        has_name = any("druzstvo" in v for v in rn)
-        # akceptuj DruzstvoID i Druzstvoid (překlepy)
-        has_id   = any(("druzstvoid" in v) or ("druzstvoid" in v) or v == "id" for v in rn)
+        rn = norm_row(r, max_c)
+        has_name = any(("druzstvo" in v and "id" not in v and "vedouci" not in v) for v in rn)
+        # akceptuj více variant pro ID (DruzstvoID, Druzstvoid, id_druzstva, prosté "id")
+        has_id = any(("druzstvoid" in v) or ("druzstvoid" in v) or ("iddruzstva" in v) or (v == "id") for v in rn)
         if has_name and has_id:
             hdr_row = r
             break
@@ -69,14 +78,22 @@ def read_excel_config(xlsx_path: Path, team_name: str):
     idx = {}
     for c in range(1, max_c + 1):
         h = norm(setup.cell(hdr_row, c).value or "")
+
+        # Družstvo (název)
         if ("druzstvo" in h) and ("id" not in h) and ("vedouci" not in h):
             idx["name"] = c
-        if ("druzstvoid" in h) or ("druzstvoid" in h) or h == "id" or "iddruzstva" in h:
+
+        # ID družstva
+        if ("druzstvoid" in h) or ("druzstvoid" in h) or ("iddruzstva" in h) or (h == "id"):
             idx["id"] = c
-        if "vedoucidomacich" in h or (("vedouci" in h) and ("host" not in h)):
+
+        # Vedoucí domácích / hostů
+        if "vedoucidomacich" in h or ("vedouci" in h and "host" not in h):
             idx["ved_dom"] = c
-        if "vedoucihostu" in h or (("vedouci" in h) and ("host" in h)):
+        if "vedoucihostu" in h or ("vedouci" in h and "host" in h):
             idx["ved_host"] = c
+
+        # Herna, začátek, konec
         if "herna" in h:
             idx["herna"] = c
         if "zacatekut" in h or "zacatek" in h:
@@ -87,19 +104,20 @@ def read_excel_config(xlsx_path: Path, team_name: str):
     if "name" not in idx or "id" not in idx:
         raise RuntimeError("V setup!Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
 
-    # --- najdi řádek družstva pod hlavičkou ---
+    # --- najdi zvolený tým pod hlavičkou ---
     team = None
     r = hdr_row + 1
     while r <= setup.max_row:
-        nm = setup.cell(r, idx["name"]).value
-        if nm is None or str(nm).strip() == "":
+        nm_cell = setup.cell(r, idx["name"]).value
+        if nm_cell is None or str(nm_cell).strip() == "":
             break  # konec tabulky
-        if str(nm).strip().lower() == team_name.strip().lower():
+        if str(nm_cell).strip().lower() == team_name.strip().lower():
             def getcol(key):
                 c = idx.get(key)
                 return setup.cell(r, c).value if c else None
+
             team = {
-                "name":    str(nm).strip(),
+                "name":    str(nm_cell).strip(),
                 "id":      str(getcol("id") or "").strip(),
                 "ved_dom": getcol("ved_dom"),
                 "ved_host":getcol("ved_host"),
@@ -116,6 +134,7 @@ def read_excel_config(xlsx_path: Path, team_name: str):
         raise RuntimeError("Prázdné DruzstvoID.")
 
     return login, pwd, team
+
 
 
 def click_save_and_continue(page):
