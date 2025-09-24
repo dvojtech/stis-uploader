@@ -221,15 +221,17 @@ def main():
     if not xlsx_path.exists():
         raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
 
-    # … (čtení Excelu atd.)
+    # --- načti přihlašovací údaje a družstvo z Excelu ---
+    user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
 
+    # --- režim prohlížeče ---
     headed = bool(getattr(args, "headed", True))
     headless = not headed
 
     with sync_playwright() as p:
         ensure_pw_browsers()
-        # robustní launch: Chromium → Chrome → Edge
-        browser = None
+
+        # robustní launch: managed Chromium → Chrome → Edge
         try:
             browser = p.chromium.launch(headless=headless)
         except Exception:
@@ -242,25 +244,30 @@ def main():
         page = context.new_page()
 
         # 1) login
-        page.goto("https://registr.ping-pong.cz/htm/auth/login.php", wait_until="domcontentloaded")
-        page.fill("input[name=login]", login)
-        page.fill("input[name=heslo]", pwd)
-        page.locator("[name=send]").click()
-        page.wait_for_load_state("networkidle")
-
-        # 2) družstvo
-        page.goto(f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}",
+        page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
                   wait_until="domcontentloaded")
+        page.fill("input[name='login']", user_login)
+        page.fill("input[name='heslo']",  user_pwd)
+        page.locator("[name='send']").click()
+        page.wait_for_load_state("domcontentloaded")
+
+        # 2) stránka družstva podle ID
+        page.goto(
+            f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}",
+            wait_until="domcontentloaded"
+        )
 
         # 3) vložit/upravit zápis
         l = page.locator("a:has-text('vložit zápis')")
-        if not l.count(): l = page.locator("a:has-text('upravit zápis')")
+        if not l.count():
+            l = page.locator("a:has-text('upravit zápis')")
         l.first.click()
         page.wait_for_load_state("domcontentloaded")
 
-        # 4) úvodní část
+        # 4) úvodní část – herna/začátek/vedoucí
         if team.get("herna") and page.locator("input[name='zapis_herna']").count():
             page.fill("input[name='zapis_herna']", str(team["herna"]))
+
         if team.get("zacatek"):
             if page.locator("input[name='zapis_zacatek']").count():
                 page.fill("input[name='zapis_zacatek']", team["zacatek"])
@@ -271,25 +278,26 @@ def main():
                     if sels.count() >= 2:
                         sels.nth(0).select_option(value=hh)
                         sels.nth(1).select_option(value=mm)
-                except: pass
+                except:
+                    pass
 
         if team.get("ved_dom") and page.locator("select[name='id_domaci_vedouci']").count():
             page.select_option("select[name='id_domaci_vedouci']", label=str(team["ved_dom"]))
         if team.get("ved_host") and page.locator("select[name='id_hoste_vedouci']").count():
             page.select_option("select[name='id_hoste_vedouci']", label=str(team["ved_host"]))
 
-        # 5) Uložit a pokračovat -> čekej na online formulář
+        # 5) Uložit a pokračovat → online formulář
         if not click_save_and_continue(page):
             raise RuntimeError("Nenašel jsem tlačítko 'Uložit a pokračovat'.")
         page.wait_for_url(re.compile(r".*/online\.php\?u=\d+"), timeout=20000)
         page.wait_for_selector("input[type='text']", timeout=10000)
 
         # nech okno otevřené pro vizuální dokončení
-        if args.headed:
+        if headed:
             print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
-            while True: time.sleep(1)
+            while True:
+                time.sleep(1)
         else:
+            context.close()
             browser.close()
 
-if __name__ == "__main__":
-    main()
