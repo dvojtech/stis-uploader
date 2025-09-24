@@ -6,36 +6,31 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 def ensure_pw_browsers():
-    """Zajistí, že je stažený Chromium pro Playwright. Pokud chybí, stáhne ho.
-       Instalace jde do uživatelského profilu: %LOCALAPPDATA%\\ms-playwright
+    """Zajistí stáhnuté prohlížeče pro Playwright (Chromium).
+       Funguje i z PyInstaller EXE – použijeme playwright.__main__ a sys.argv hack.
     """
-    # kam Playwright standardně stahuje prohlížeče na Windows
-    default_store = Path(os.environ.get("LOCALAPPDATA", Path.home()))
-    default_store = default_store / "ms-playwright"
+    default_store = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ms-playwright"
     os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(default_store))
 
-    # jednoduchá kontrola, zda už Chromium existuje
+    # Je už Chromium stažené?
     chromium_ok = False
     if default_store.exists():
-        # hledáme chrome.exe uvnitř chromium-* složky
         for p in default_store.glob("chromium-*/*/chrome.exe"):
             if p.exists():
                 chromium_ok = True
                 break
-
     if chromium_ok:
-        return  # hotovo, nic nestahujeme
+        return
 
-    # stáhni prohlížeče přes vestavěné CLI Playwrightu (funguje i v PyInstaller EXE)
+    # Stáhni přes CLI: ekvivalent `playwright install chromium`
+    import playwright.__main__ as pw_cli
+    old_argv = sys.argv[:]          # zapamatuj původní argv
     try:
-        import playwright.__main__ as pw_cli
-        # ekvivalent: `playwright install chromium`
-        pw_cli.main(["install", "chromium"])
-    except SystemExit as e:
-        # CLI volá sys.exit(); exit code 0 je OK
-        code = getattr(e, "code", 0) or 0
-        if int(code) != 0:
-            raise
+        sys.argv = ["playwright", "install", "chromium"]
+        pw_cli.main()               # v binale verzi bere argumenty z sys.argv
+    finally:
+        sys.argv = old_argv
+
 
 def norm(x) -> str:
     s = "" if x is None else str(x)
@@ -240,9 +235,17 @@ def main():
 
     login, pwd, team = read_excel_config(xlsx_path, args.team)
 
-    with sync_playwright() as p:
-        ensure_pw_browsers()
+with sync_playwright() as p:
+    ensure_pw_browsers()
+    try:
         browser = p.chromium.launch(headless=not args.headed)
+    except Exception:
+        # fallback: použij nainstalovaný Chrome/Edge
+        try:
+            browser = p.chromium.launch(channel="chrome", headless=not args.headed)
+        except Exception:
+            browser = p.chromium.launch(channel="msedge", headless=not args.headed)
+
 
         ctx = browser.new_context()
         page = ctx.new_page()
