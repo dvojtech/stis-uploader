@@ -18,16 +18,16 @@ jobs:
         run: python -m py_compile stis_uploader.py
 
       # (volitelné) stopni build, pokud jsou v souboru tabulátory
-      - name: Guard: no tabs in source (optional)
+      - name: "Guard - no tabs in source (optional)"
         shell: pwsh
         run: |
-          if (Select-String -Path stis_uploader.py -Pattern "`t") {
-            Write-Error "Tabs detected in stis_uploader.py – please convert to spaces."
+          if (Select-String -Path stis_uploader.py -SimpleMatch "`t") {
+            throw "Tabs detected in stis_uploader.py – please convert to spaces."
           }
 
       - name: Install deps
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install playwright openpyxl pyinstaller
           python -m playwright install chromium
 
@@ -35,10 +35,10 @@ jobs:
         shell: pwsh
         run: |
           $src = "$env:USERPROFILE\AppData\Local\ms-playwright"
-          Copy-Item -Recurse -Force $src ms-playwright
+          if (Test-Path $src) { Copy-Item -Recurse -Force $src ms-playwright }
 
       - name: Build EXE
-        run: pyinstaller --onefile --noconsole --name "stis-uploader" --collect-all playwright --add-data "ms-playwright;ms-playwright" stis_uploader.py
+        run: pyinstaller --onefile --noconsole --name stis-uploader --collect-all playwright --add-data "ms-playwright;ms-playwright" stis_uploader.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
