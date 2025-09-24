@@ -49,7 +49,7 @@ def get_setup_sheet(wb):
 
 def read_excel_config(xlsx_path: Path, team_name: str):
     """
-    Načte login/heslo ze setup!B1:B2 a řádek družstva z tabulky 'Teams'.
+    Načte login/heslo ze setup!B1:B2 a řádek družstva z tabulky Teams.
     Hlavičku tabulky najde kdekoli v prvních ~30 řádcích (nezávisí na řádku 6)
     a je tolerantní k diakritice/překlepům (DruzstvoID/Druzstvoid apod.).
     """
@@ -62,27 +62,36 @@ def read_excel_config(xlsx_path: Path, team_name: str):
     if not login or not pwd:
         raise RuntimeError("Vyplň login/heslo v setup!B1:B2.")
 
-    # --- pomocné: načti a normalizuj řádek buněk ---
+    # Pomocné normování řádku
     def norm_row(r, max_c):
         return [norm(setup.cell(r, c).value or "") for c in range(1, max_c + 1)]
 
     max_r = min(30, setup.max_row)
     max_c = min(60, setup.max_column)
 
-    # --- najdi řádek hlavičky: musí obsahovat jméno družstva i ID ---
+    # --- najdi řádek hlavičky ---
+    id_markers = ("druzstvoid", "druzstvoid", "iddruzstva", "id")  # podporované varianty
     hdr_row = None
     for r in range(1, max_r + 1):
         rn = norm_row(r, max_c)
         has_name = any(("druzstvo" in v and "id" not in v and "vedouci" not in v) for v in rn)
-        # akceptuj více variant pro ID (DruzstvoID, Druzstvoid, id_druzstva, prosté "id")
-        has_id = any(("druzstvoid" in v) or ("druzstvoid" in v) or ("iddruzstva" in v) or (v == "id") for v in rn)
+        has_id   = any(any(m in v for m in id_markers) for v in rn)
         if has_name and has_id:
             hdr_row = r
             break
+
     if hdr_row is None:
+        # DEBUG: zapiš prvních pár řádků, jak je vidíme
+        try:
+            with open(Path(xlsx_path).with_suffix(".log"), "w", encoding="utf-8") as f:
+                f.write("Header not found. Top rows (normalized):\n")
+                for r in range(1, min(15, setup.max_row) + 1):
+                    f.write(f"R{r}: {norm_row(r, max_c)}\n")
+        except Exception:
+            pass
         raise RuntimeError("V setup!Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
 
-    # --- namapuj sloupce podle nalezené hlavičky (synonyma povolena) ---
+    # --- namapuj sloupce podle nalezené hlavičky ---
     idx = {}
     for c in range(1, max_c + 1):
         h = norm(setup.cell(hdr_row, c).value or "")
@@ -91,8 +100,8 @@ def read_excel_config(xlsx_path: Path, team_name: str):
         if ("druzstvo" in h) and ("id" not in h) and ("vedouci" not in h):
             idx["name"] = c
 
-        # ID družstva
-        if ("druzstvoid" in h) or ("druzstvoid" in h) or ("iddruzstva" in h) or (h == "id"):
+        # ID družstva – přijmi více variant
+        if any(m in h for m in ("druzstvoid", "druzstvoid", "iddruzstva")) or h == "id":
             idx["id"] = c
 
         # Vedoucí domácích / hostů
@@ -142,6 +151,7 @@ def read_excel_config(xlsx_path: Path, team_name: str):
         raise RuntimeError("Prázdné DruzstvoID.")
 
     return login, pwd, team
+
 
 
 
