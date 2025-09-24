@@ -193,7 +193,15 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--xlsx", required=True, help="plná cesta k XLSX")
     p.add_argument("--team", required=True, help="název družstva (setup/Teams sloupec Družstvo)")
+
+    # headed/headless přepínače (vzájemně se vylučují), default = headed (viditelné okno)
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--headed",  dest="headed",  action="store_true",  help="spusť s viditelným prohlížečem")
+    g.add_argument("--headless", dest="headed", action="store_false", help="spusť bez UI (headless)")
+    p.set_defaults(headed=True)
+
     return p.parse_args()
+
 
 def main():
     args = parse_args()
@@ -211,7 +219,9 @@ def main():
     login, pwd, team = read_excel_config(xlsx_path, args.team)
 
     with sync_playwright() as p:
+        ensure_pw_browsers()
         browser = p.chromium.launch(headless=not args.headed)
+
         ctx = browser.new_context()
         page = ctx.new_page()
 
