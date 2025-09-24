@@ -1,0 +1,39 @@
+name: build-uploader
+on:
+  workflow_dispatch:
+
+jobs:
+  build-win:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install playwright openpyxl pyinstaller
+          python -m playwright install chromium
+
+      - name: Copy browsers into repo
+        shell: pwsh
+        run: |
+          $src = "$env:USERPROFILE\AppData\Local\ms-playwright"
+          Copy-Item -Recurse -Force $src ms-playwright
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --noconsole ^
+            --name stis-uploader ^
+            --collect-all playwright ^
+            --add-data "ms-playwright;ms-playwright" ^
+            stis_uploader.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: stis-uploader
+          path: dist/stis-uploader.exe
