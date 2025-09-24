@@ -31,28 +31,82 @@ def _log(msg):
     except Exception:
         pass
         
-def wait_online_ready(page, log, timeout=20000):
+def wait_online_ready(page, log, timeout=25000):
+    # počkej na řádek zápasu a aspoň jeden vstup na sety
     page.wait_for_selector("#zapis .event", state="visible", timeout=timeout)
-    page.wait_for_selector("#zapis .event input.zapas-set", state="visible", timeout=timeout)
+    page.wait_for_selector("#zapis .event .event-sety input.zapas-set", state="visible", timeout=timeout)
     log("Online editor ready.")
 
-def _choose_player_loc(page, loc, name, log, timeout=4000):
-    """Klik do buňky hráče → jQuery-UI autocomplete → Enter."""
+def _choose_player_loc(page, loc, name, log, timeout_each=2000):
+    """
+    Klikne do buňky hráče a vyplní jméno přes autocomplete.
+    Zkouší několik vzorů a nakonec i :focus fallback. Ignoruje disabled/skryté inputy.
+    """
     name = (name or "").strip()
     if not name:
         return
+
+    # 1) klik do cílové buňky (span/div se jménem)
     loc.click()
+    page.wait_for_timeout(80)
+
+    # 2) kandidáti na autocomplete input
+    candidates = [
+        "input.ui-autocomplete-input",
+        "input.ac_input",
+        # obecný viditelný text input, ale NE sety ani skóre, NE disabled
+        "input[type='text']:not(.zapas-set):not(.utkani-skore):not([name='body']):not([disabled])"
+    ]
+
+    for css in candidates:
+        try:
+            inp = page.locator(css).first
+            inp.wait_for(state="visible", timeout=timeout_each)
+            # bezpečně smaž a napiš
+            inp.click()
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
+            inp.fill(name)
+            page.keyboard.press("Enter")
+            page.wait_for_timeout(120)
+            log(f"  player ← {name} (via {css})")
+            return
+        except PwTimeout:
+            # nenašli jsme viditelný input tohoto typu – zkus další
+            pass
+        except Exception as e:
+            log(f"  candidate {css} failed: {repr(e)}")
+
+    # 3) fallback: aktuálně fokusovaný element (většinou autocomplete input)
     try:
-        inp = page.locator("input.ui-autocomplete-input")
-        inp.wait_for(state="visible", timeout=timeout)
-    except PwTimeout:
-        # fallback: poslední viditelný text input (autocomplete ho dotváří)
-        inp = page.locator("input[type='text']").filter(has_not=page.locator(".zapas-set")).last
-        inp.wait_for(state="visible", timeout=timeout)
-    inp.fill(name)
-    page.keyboard.press("Enter")
-    page.wait_for_timeout(120)
-    log(f"  player ← {name}")
+        foc = page.locator(":focus")
+        if foc.count() > 0:
+            tag  = foc.evaluate("el => el.tagName.toLowerCase()")
+            typ  = foc.evaluate("el => el.type || ''")
+            dis  = foc.evaluate("el => !!el.disabled")
+            if tag == "input" and typ in ("text", "search") and not dis:
+                foc.click()
+                page.keyboard.press("Control+A")
+                page.keyboard.press("Backspace")
+                foc.fill(name)
+                page.keyboard.press("Enter")
+                page.wait_for_timeout(120)
+                log(f"  player ← {name} (via :focus)")
+                return
+    except Exception as e:
+        log(f"  :focus fallback failed: {repr(e)}")
+
+    # 4) poslední nouze – napiš naslepo do aktivního prvku
+    try:
+        page.keyboard.type(name)
+        page.keyboard.press("Enter")
+        log(f"  player ← {name} (typed)")
+        return
+    except Exception:
+        pass
+
+    # když nic nevyšlo, ať je to vidět v logu i výjimkou
+    raise RuntimeError(f"Autocomplete input pro hráče '{name}' se nenašel (všechny varianty selhaly).")
 
 def _fill_sets_for_event(event_loc, sets, log):
     """Vyplní až 5 setů v daném řádku .event."""
