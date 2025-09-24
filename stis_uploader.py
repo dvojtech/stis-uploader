@@ -17,6 +17,53 @@ BOOT_FILES = [
     TEMP_DIR / "stis_boot.log",
     EXE_DIR / "stis_boot.log",
 ]
+# --- konfigurace mapování řádků v listu "zdroj" ---
+ZDROJ_SHEET             = "zdroj"
+ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I–M = sety)
+SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
+
+def map_wo(s):
+    """mapování WO značek na STIS kódy, jinak vrací čistý text/číslo"""
+    t = str(s or "").strip()
+    if not t:
+        return ""
+    if t.upper() in ("WO 3:0", "WO 3:0", "WO3:0"):
+        return "101"
+    if t.upper() in ("WO 0:3", "WO 0:3", "WO0:3"):
+        return "-101"
+    return t
+
+def read_zdroj_data(xlsx_path):
+    """Načte čtyřhru a singly z listu 'zdroj' – podle výše uvedených konstant."""
+    from openpyxl import load_workbook
+    wb = load_workbook(xlsx_path, data_only=True)
+    if ZDROJ_SHEET not in wb.sheetnames:
+        raise RuntimeError(f"V sešitu chybí list '{ZDROJ_SHEET}'")
+    sh = wb[ZDROJ_SHEET]
+
+    def cell(r, c):
+        return str(sh.cell(r, c).value or "").strip()
+
+    # ČTYŘHRA – jména (D2,D3,E2,E3) a sety (I3..M3)
+    double = {
+        "home1": cell(2, 4),  # D2
+        "home2": cell(3, 4),  # D3
+        "away1": cell(2, 5),  # E2
+        "away2": cell(3, 5),  # E3
+        "sets":  [ map_wo(cell(3, 9+i)) for i in range(5) ]  # I3..M3
+    }
+
+    # SINGLY – indexy 2..(2+SINGLES_COUNT-1) → řádky od ZDROJ_FIRST_SINGLE_ROW
+    singles = []
+    row = ZDROJ_FIRST_SINGLE_ROW
+    for idx in range(2, 2 + SINGLES_COUNT):
+        home = cell(row, 4)  # D
+        away = cell(row, 5)  # E
+        sets = [ map_wo(cell(row, 9+i)) for i in range(5) ]  # I..M
+        singles.append({"idx": idx, "home": home, "away": away, "sets": sets})
+        row += 1
+
+    return {"double": double, "singles": singles}
 
 def boot(msg: str):
     """Zapiš krátkou zprávu ještě před main() – přežije i selhání argparse."""
@@ -82,6 +129,38 @@ def ensure_pw_browsers(log=None):
         sys.argv = old_argv
 
 
+def _safe_fill(page, sel, value, log):
+    if not value:
+        return
+    loc = page.locator(sel)
+    if loc.count():
+        try:
+            loc.first.fill(str(value))
+            log("fill", sel, "→", value)
+        except Exception as e:
+            log("fill FAILED", sel, repr(e))
+
+def _fill_sets(page, base_idx, sets, log):
+    for i, val in enumerate(sets, start=1):
+        if not val: 
+            continue
+        sel = f"input[name='set{i}_{base_idx}']"
+        _safe_fill(page, sel, val, log)
+
+def fill_online_from_zdroj(page, data, log):
+    """Vyplní čtyřhru (index 0) a singly (indexy 2..)**/"""
+    d = data["double"]
+    _safe_fill(page, "input[name='domaciHrac_0']",  d["home1"], log)
+    _safe_fill(page, "input[name='domaciHrac2_0']", d["home2"], log)
+    _safe_fill(page, "input[name='hostujiciHrac_0']",  d["away1"], log)
+    _safe_fill(page, "input[name='hostujiciHrac2_0']", d["away2"], log)
+    _fill_sets(page, 0, d["sets"], log)
+
+    for m in data["singles"]:
+        idx = m["idx"]
+        _safe_fill(page, f"input[name='domaciHrac_{idx}']",   m["home"], log)
+        _safe_fill(page, f"input[name='hostujiciHrac_{idx}']", m["away"], log)
+        _fill_sets(page, idx, m["sets"], log)
 
 
 def norm(x) -> str:
@@ -475,7 +554,19 @@ def main():
                 # fallback: aspoň počkat na nějaké textové inputy
                 page.wait_for_selector("input[type='text']", timeout=10000)
             log("Online formulář načten:", page.url)
+            # ... po logu: Online formulář načten: page.url
+            data = read_zdroj_data(xlsx_path)
+            fill_online_from_zdroj(page, data, log)
+            
+            # volitelně uložit
+            try:
+                page.get_by_role("button", name=re.compile(r"uložit\s*změny", re.I)).first.click(timeout=3000)
+                log("Kliknuto na 'Uložit změny'.")
+            except Exception as e:
+                log("'Uložit změny' nenalezeno / přeskočeno:", repr(e))
 
+
+            
             # 9) vizuální dokončení
             if headed:
                 log("Leaving browser open for manual finish.")
