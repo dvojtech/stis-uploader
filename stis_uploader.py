@@ -31,57 +31,92 @@ def as_time_txt(v):
     m = re.match(r"^(\d{1,2}):(\d{2})$", s)
     return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
 
+def get_setup_sheet(wb):
+    # najdi list 'setup' case-insensitive, jinak první list
+    for ws in wb.worksheets:
+        if (ws.title or "").strip().lower() == "setup":
+            return ws
+    return wb.active
+
 def read_excel_config(xlsx_path: Path, team_name: str):
     wb = load_workbook(xlsx_path, data_only=True)
-    setup = wb["setup"]
+    setup = get_setup_sheet(wb)
 
     login = str(setup["B1"].value or "").strip()
     pwd   = str(setup["B2"].value or "")
     if not login or not pwd:
         raise RuntimeError("Vyplň login/heslo v setup!B1:B2.")
 
-    HDR_ROW = 6  # řádek hlavičky tvé tabulky Teams
-    headers = [str(c.value or "").strip() for c in setup[HDR_ROW]]
+    # --- vyhledej řádek hlavičky kdekoli v prvních 30 řádcích ---
+    def row_norm(r, max_c):
+        return [norm(setup.cell(r, c).value or "") for c in range(1, max_c + 1)]
 
-    want = {
-        "druzstvo": None, "druzstvoid": None, "vedoucidomacich": None,
-        "vedoucihostu": None, "herna": None, "zacatekut": None, "konecutkani": None,
-    }
-    for idx, h in enumerate(headers, start=1):
-        k = norm(h)
-        for key in list(want.keys()):
-            if norm(key) in k and want[key] is None:
-                want[key] = idx
-
-    if not want["druzstvo"] or not want["druzstvoid"]:
+    max_r = min(30, setup.max_row)
+    max_c = min(50, setup.max_column)
+    hdr_row = None
+    for r in range(1, max_r + 1):
+        rn = row_norm(r, max_c)
+        has_name = any("druzstvo" in v for v in rn)
+        # akceptuj DruzstvoID i Druzstvoid (překlepy)
+        has_id   = any(("druzstvoid" in v) or ("druzstvoid" in v) or v == "id" for v in rn)
+        if has_name and has_id:
+            hdr_row = r
+            break
+    if hdr_row is None:
         raise RuntimeError("V setup!Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
 
+    # --- namapuj sloupce podle nalezené hlavičky (synonyma povolena) ---
+    idx = {}
+    for c in range(1, max_c + 1):
+        h = norm(setup.cell(hdr_row, c).value or "")
+        if ("druzstvo" in h) and ("id" not in h) and ("vedouci" not in h):
+            idx["name"] = c
+        if ("druzstvoid" in h) or ("druzstvoid" in h) or h == "id" or "iddruzstva" in h:
+            idx["id"] = c
+        if "vedoucidomacich" in h or (("vedouci" in h) and ("host" not in h)):
+            idx["ved_dom"] = c
+        if "vedoucihostu" in h or (("vedouci" in h) and ("host" in h)):
+            idx["ved_host"] = c
+        if "herna" in h:
+            idx["herna"] = c
+        if "zacatekut" in h or "zacatek" in h:
+            idx["zacatek"] = c
+        if "konecutkani" in h or "konec" in h:
+            idx["konec"] = c
+
+    if "name" not in idx or "id" not in idx:
+        raise RuntimeError("V setup!Teams chybí sloupce 'Družstvo' a/nebo 'DruzstvoID'.")
+
+    # --- najdi řádek družstva pod hlavičkou ---
     team = None
-    r = HDR_ROW + 1
-    while True:
-        nm = setup.cell(r, want["druzstvo"]).value
-        if nm is None:
-            break
+    r = hdr_row + 1
+    while r <= setup.max_row:
+        nm = setup.cell(r, idx["name"]).value
+        if nm is None or str(nm).strip() == "":
+            break  # konec tabulky
         if str(nm).strip().lower() == team_name.strip().lower():
+            def getcol(key):
+                c = idx.get(key)
+                return setup.cell(r, c).value if c else None
             team = {
-                "name": str(nm).strip(),
-                "id":   str(setup.cell(r, want["druzstvoid"]).value).strip(),
-                "ved_dom": (setup.cell(r, want["vedoucidomacich"]).value
-                            if want["vedoucidomacich"] else None),
-                "ved_host": (setup.cell(r, want["vedoucihostu"]).value
-                             if want["vedoucihostu"] else None),
-                "herna": (setup.cell(r, want["herna"]).value if want["herna"] else None),
-                "zacatek": as_time_txt(setup.cell(r, want["zacatekut"]).value) if want["zacatekut"] else None,
-                "konec":   as_time_txt(setup.cell(r, want["konecutkani"]).value) if want["konecutkani"] else None,
+                "name":    str(nm).strip(),
+                "id":      str(getcol("id") or "").strip(),
+                "ved_dom": getcol("ved_dom"),
+                "ved_host":getcol("ved_host"),
+                "herna":   getcol("herna"),
+                "zacatek": as_time_txt(getcol("zacatek")),
+                "konec":   as_time_txt(getcol("konec")),
             }
             break
         r += 1
+
     if not team:
         raise RuntimeError(f"Družstvo '{team_name}' nenalezeno v setup!Teams.")
     if not team["id"]:
         raise RuntimeError("Prázdné DruzstvoID.")
 
     return login, pwd, team
+
 
 def click_save_and_continue(page):
     sels = [
