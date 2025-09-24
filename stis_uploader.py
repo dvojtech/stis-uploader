@@ -5,10 +5,15 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 
 def ensure_pw_browsers():
-    base = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path(__file__).parent
+    # když běží z EXE (onefile), data jsou v sys._MEIPASS
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        base = Path(sys._MEIPASS)
+    else:
+        base = Path(__file__).parent
     browsers = base / "ms-playwright"
     if browsers.is_dir():
         os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(browsers)
+
 
 def norm(s: str) -> str:
     s = (s or "").strip().lower()
