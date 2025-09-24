@@ -131,32 +131,40 @@ def read_zdroj_data(xlsx_path):
 
     return {"double": double, "singles": singles}
 
-def fill_online_from_zdroj(page, data, log, xlsx_path):
-    """Vyplní čtyřhru (index 0) a singly (indexy 2..) na online formuláři STIS."""
+def fill_online_from_zdroj(page, data, log, xlsx_path=None):
+    """
+    Vyplní čtyřhru (index 0) a singly (indexy 2..) na online formuláři STIS.
+    xlsx_path je volitelný – když je, uloží se případný DOM dump vedle sešitu.
+    """
+
+    # 1) čekej až se pole objeví
     try:
         wait_online_ready(page, log, timeout=20000)
     except Exception:
         log("Inputs se neobjevily do 20 s – dělám dump DOMu.")
-        dump_dom(page, xlsx_path, log)   # ← potřebuje xlsx_path
+        try:
+            if xlsx_path:
+                dump_dom(page, xlsx_path, log)
+        except Exception as e:
+            log("Dump DOM selhal:", repr(e))
         raise
 
-    # čtyřhra (index 0)
+    # 2) čtyřhra (index 0)
     d = data["double"]
-    _fill_name(page, "domaciHrac",  0, d["home1"], log)
-    _fill_name(page, "domaciHrac2", 0, d["home2"], log)
-    _fill_name(page, "hostujiciHrac",  0, d["away1"], log)
-    _fill_name(page, "hostujiciHrac2", 0, d["away2"], log)
-    for i, v in enumerate(d["sets"], start=1):
+    _fill_name(page, "domaciHrac",  0, d.get("home1"), log)
+    _fill_name(page, "domaciHrac2", 0, d.get("home2"), log)
+    _fill_name(page, "hostujiciHrac",  0, d.get("away1"), log)
+    _fill_name(page, "hostujiciHrac2", 0, d.get("away2"), log)
+    for i, v in enumerate(d.get("sets", []), start=1):
         _fill_set(page, i, 0, v, log)
 
-    # singly (indexy 2..)
-    for m in data["singles"]:
+    # 3) singly (indexy 2..)
+    for m in data.get("singles", []):
         idx = m["idx"]
-        _fill_name(page, "domaciHrac", idx, m["home"], log)
-        _fill_name(page, "hostujiciHrac", idx, m["away"], log)
-        for i, v in enumerate(m["sets"], start=1):
+        _fill_name(page, "domaciHrac",   idx, m.get("home"), log)
+        _fill_name(page, "hostujiciHrac", idx, m.get("away"), log)
+        for i, v in enumerate(m.get("sets", []), start=1):
             _fill_set(page, i, idx, v, log)
-
 
 def boot(msg: str):
     """Zapiš krátkou zprávu ještě před main() – přežije i selhání argparse."""
