@@ -113,20 +113,77 @@ def find_teams_header_anywhere(wb):
     """
     Projdi všechny listy a najdi první řádek, kde je hlavička tabulky Teams:
       - obsahuje 'druzstvo' (ale ne 'id' / 'vedouci')
-      - a zároveň některý marker ID ('druzstvoid', 'druzstvoid', 'iddruzstva', 'id')
+      - a zároveň některý JASNÝ marker ID ('druzstvoid', 'id_druzstva', 'iddruzstva') nebo PŘESNĚ 'id'
     Vrací (sheet, hdr_row) nebo (None, None).
     """
-    id_markers = ("druzstvoid", "druzstvoid", "iddruzstva", "id")
+    strict_id_markers = ("druzstvoid", "id_druzstva", "iddruzstva")  # žádné volné "id" jako podřetězec!
     for ws in wb.worksheets:
         max_r = min(60, ws.max_row or 0)
         max_c = min(80, ws.max_column or 0)
         for r in range(1, max_r + 1):
             row_norm = [norm(ws.cell(r, c).value or "") for c in range(1, max_c + 1)]
             has_name = any(("druzstvo" in v and "id" not in v and "vedouci" not in v) for v in row_norm)
-            has_id   = any(any(m in v for m in id_markers) for v in row_norm)
+            has_id   = any(any(m in v for m in strict_id_markers) or (v == "id") for v in row_norm)
             if has_name and has_id:
                 return ws, r
     return None, None
+
+def open_match_form(page, log):
+    """Na stránce družstva otevře formulář – preferuje 'vložit zápis', jinak 'upravit zápis'.
+       Zkouší text i href (zapis_start.php / online.php). Vrací True/False.
+    """
+    try:
+        page.wait_for_selector(
+            "a:has-text('vložit zápis'), a:has-text('upravit zápis'), "
+            "a[href*='zapis_start.php?u='], a[href*='online.php?u=']",
+            timeout=15000
+        )
+    except Exception:
+        log("Nenalezl jsem žádný z očekávaných odkazů do 15 s.")
+        return False
+
+    candidates = [
+        page.get_by_role("link", name=re.compile(r"vložit\s*zápis", re.I)),
+        page.get_by_role("link", name=re.compile(r"upravit\s*zápis", re.I)),
+        page.locator("a[href*='zapis_start.php?u=']"),
+        page.locator("a[href*='online.php?u=']"),
+    ]
+
+    for i, sel in enumerate(candidates, 1):
+        try:
+            if sel.count():
+                log(f"Zkouším selector {i}")
+                sel.first.click(timeout=5000)
+                page.wait_for_load_state("domcontentloaded")
+
+                if page.locator("text=/vkládání zápisu/i").count() \
+                   or "online.php?u=" in page.url \
+                   or "zapis_start.php?u=" in page.url:
+                    log("Formulář otevřen na URL:", page.url)
+                    return True
+
+                if page.locator("text=/špatn.*url/i").count():
+                    log("Server hlásí 'špatné URL' – zkusím jiný odkaz.")
+                    page.go_back()
+                    page.wait_for_load_state("domcontentloaded")
+        except Exception as e:
+            log(f"Selector {i} selhal:", repr(e))
+
+    # poslední záchrana – proskenuj všechny <a> a skoč přímo na vyhovující href
+    try:
+        anchors = page.eval_on_selector_all(
+            "a",
+            "els => els.map(a => ({text: (a.textContent||'').trim(), href: a.href||''}))"
+        )
+        for a in anchors:
+            if re.search(r"(zapis_start\.php|online\.php)\?u=\d+", a.get("href",""), re.I):
+                log("Jdu přímo na", a["href"])
+                page.goto(a["href"], wait_until="domcontentloaded")
+                return True
+    except Exception as e:
+        log("Fallback scan anchorů selhal:", repr(e))
+
+    return False
 
 def read_excel_config(xlsx_path: Path, team_name: str):
     """
@@ -158,21 +215,29 @@ def read_excel_config(xlsx_path: Path, team_name: str):
     if not login or not pwd:
         raise RuntimeError("Vyplň login/heslo (B1/B2, nebo vedle popisků 'login'/'heslo').")
 
-    # 3) Namapuj sloupce podle hlavičky
-    id_markers = ("druzstvoid", "druzstvoid", "iddruzstva", "id")
+    # 3) Namapuj sloupce podle hlavičky (ID sloupec detekuj STRIKTNĚ + vyluč 'vedouci*')
     max_c = min(80, setup.max_column or 0)
     idx = {}
     for c in range(1, max_c + 1):
         h = norm(setup.cell(hdr_row, c).value or "")
 
+        # Družstvo (název)
         if ("druzstvo" in h) and ("id" not in h) and ("vedouci" not in h):
             idx["name"] = c
-        if any(m in h for m in id_markers):
+
+        # ID družstva – akceptuj jasné varianty a/nebo přesné 'id', nikdy ne cokoliv s 'vedouci'
+        is_id_col = (("druzstvoid" in h) or ("id_druzstva" in h) or ("iddruzstva" in h) or (h == "id")) \
+                    and ("vedouci" not in h)
+        if is_id_col:
             idx["id"] = c
+
+        # Vedoucí domácích / hostů
         if "vedoucidomacich" in h or ("vedouci" in h and "host" not in h):
             idx["ved_dom"] = c
         if "vedoucihostu" in h or ("vedouci" in h and "host" in h):
             idx["ved_host"] = c
+
+        # Herna, začátek, konec
         if "herna" in h:
             idx["herna"] = c
         if "zacatekut" in h or "zacatek" in h:
@@ -211,7 +276,15 @@ def read_excel_config(xlsx_path: Path, team_name: str):
     if not team["id"]:
         raise RuntimeError("Prázdné DruzstvoID u zvoleného družstva.")
 
+    # 5) Očisti ID na čisté číslo (zabráníme tomu, aby se do URL dostalo 'Kozel Petr' apod.)
+    raw_id = str(team.get("id", "")).strip()
+    m = re.search(r"\d+", raw_id)
+    if not m:
+        raise RuntimeError(f"Neplatné DruzstvoID: {raw_id!r}")
+    team["id"] = m.group(0)
+
     return login, pwd, team
+
 
 def click_save_and_continue(page):
     sels = [
@@ -247,8 +320,10 @@ def parse_args():
 def main():
     args = parse_args()
     xlsx_path = Path(args.xlsx).resolve()
+    if not xlsx_path.exists():
+        raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
 
-    # zřídíme logger
+    # logger vedle XLSX
     log, log_file, log_path = make_logger(xlsx_path)
     log("==== stis_uploader start ====")
     log("XLSX:", xlsx_path)
@@ -256,36 +331,36 @@ def main():
     log("Headed:", getattr(args, "headed", True))
 
     try:
-        if not xlsx_path.exists():
-            raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
-
-        # --- načti přihlašovací údaje a družstvo z Excelu ---
+        # 1) načti přihlášení + tým
         user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
-        log("Login OK, team:", team["name"], "ID:", team["id"])
+        log("Login OK; team:", team["name"], "ID:", team["id"])
 
-        # --- režim prohlížeče ---
         headed = bool(getattr(args, "headed", True))
         headless = not headed
 
         with sync_playwright() as p:
             ensure_pw_browsers(log)
 
-            # robustní launch: managed Chromium → Chrome → Edge
+            # 2) spuštění prohlížeče (Chromium → Chrome → Edge)
             log("Launching browser… headless =", headless)
+            browser = None
             try:
                 browser = p.chromium.launch(headless=headless)
+                log("Launched: managed Chromium")
             except Exception as e1:
-                log("Chromium launch failed:", repr(e1), " – trying channel=chrome")
+                log("Chromium failed:", repr(e1), "→ trying channel=chrome")
                 try:
                     browser = p.chromium.launch(channel="chrome", headless=headless)
+                    log("Launched: channel=chrome")
                 except Exception as e2:
-                    log("Chrome launch failed:", repr(e2), " – trying channel=msedge")
+                    log("Chrome failed:", repr(e2), "→ trying channel=msedge")
                     browser = p.chromium.launch(channel="msedge", headless=headless)
+                    log("Launched: channel=msedge")
 
             context = browser.new_context()
             page = context.new_page()
 
-            # 1) login
+            # 3) login
             log("Navigating to login…")
             page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
                       wait_until="domcontentloaded")
@@ -295,47 +370,87 @@ def main():
             page.wait_for_load_state("domcontentloaded")
             log("Logged in.")
 
-            # 2) stránka družstva podle ID
-            url_team = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
-            log("Open team page:", url_team)
-            page.goto(url_team, wait_until="domcontentloaded")
+            # 4) stránka družstva
+            team_url = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
+            log("Open team page:", team_url)
+            page.goto(team_url, wait_until="domcontentloaded")
 
-            # 3) vložit/upravit zápis
-            log("Click 'vložit zápis' / 'upravit zápis'…")
-            l = page.locator("a:has-text('vložit zápis')")
-            if not l.count(): l = page.locator("a:has-text('upravit zápis')")
-            l.first.click()
-            page.wait_for_load_state("domcontentloaded")
+            # 5) najdi vstup do formuláře (vložit/upravit)
+            log("Hledám odkaz 'vložit/upravit zápis'…")
+            if not open_match_form(page, log):
+                raise RuntimeError("Na stránce družstva jsem nenašel odkaz do formuláře.")
 
-            # 4) úvodní část – herna/začátek/vedoucí
+            # 6) vyplň úvodní údaje (herna / začátek / vedoucí)
             if team.get("herna") and page.locator("input[name='zapis_herna']").count():
                 page.fill("input[name='zapis_herna']", str(team["herna"]))
+                log("Herna vyplněna:", team["herna"])
+
             if team.get("zacatek"):
                 if page.locator("input[name='zapis_zacatek']").count():
                     page.fill("input[name='zapis_zacatek']", team["zacatek"])
+                    log("Začátek (input) vyplněn:", team["zacatek"])
                 else:
+                    # pokus přes dvě <select> (hodina, minuta)
                     try:
                         hh, mm = team["zacatek"].split(":")
                         sels = page.locator("select")
                         if sels.count() >= 2:
                             sels.nth(0).select_option(value=hh)
                             sels.nth(1).select_option(value=mm)
+                            log("Začátek (selects) nastaven:", team["zacatek"])
                     except Exception as e:
                         log("Set start time via selects failed:", repr(e))
 
             if team.get("ved_dom") and page.locator("select[name='id_domaci_vedouci']").count():
                 page.select_option("select[name='id_domaci_vedouci']", label=str(team["ved_dom"]))
+                log("Vedoucí domácích:", team["ved_dom"])
+
             if team.get("ved_host") and page.locator("select[name='id_hoste_vedouci']").count():
                 page.select_option("select[name='id_hoste_vedouci']", label=str(team["ved_host"]))
+                log("Vedoucí hostů:", team["ved_host"])
 
-            # 5) Uložit a pokračovat → online formulář
+            # 7) Uložit a pokračovat (robustně)
             log("Click 'Uložit a pokračovat'…")
-            if not click_save_and_continue(page):
-                raise RuntimeError("Nenašel jsem tlačítko 'Uložit a pokračovat'.")
-            page.wait_for_url(re.compile(r".*/online\.php\?u=\d+"), timeout=20000)
-            page.wait_for_selector("input[type='text']", timeout=10000)
-            log("Online formulář načten – připraveno k ručnímu dopsání výsledků.")
+            clicked = False
+            # a) podle názvu tlačítka
+            try:
+                btn = page.get_by_role("button", name=re.compile(r"uložit.*pokračovat", re.I))
+                if btn.count():
+                    btn.first.click(timeout=5000)
+                    clicked = True
+            except Exception as e:
+                log("Button(by role) click failed:", repr(e))
+            # b) podle name='odeslat'
+            if not clicked:
+                try:
+                    sel = page.locator("input[name='odeslat'], button[name='odeslat']")
+                    if sel.count():
+                        sel.first.click(timeout=5000)
+                        clicked = True
+                except Exception as e:
+                    log("Button(name=odeslat) click failed:", repr(e))
+            # c) podle anchor textu
+            if not clicked:
+                try:
+                    a = page.locator("a:has-text('Uložit a pokračovat')")
+                    if a.count():
+                        a.first.click(timeout=5000)
+                        clicked = True
+                except Exception as e:
+                    log("Anchor(click) failed:", repr(e))
 
+            if not clicked:
+                raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
+
+            # 8) čekej na online formulář
+            try:
+                page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
+            except Exception:
+                # fallback: aspoň počkat na nějaké textové inputy
+                page.wait_for_selector("input[type='text']", timeout=10000)
+            log("Online formulář načten:", page.url)
+
+            # 9) vizuální dokončení
             if headed:
                 log("Leaving browser open for manual finish.")
                 print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
@@ -346,11 +461,10 @@ def main():
                 browser.close()
 
     except Exception as e:
-        # zapiš chybový stack a otevři log v Notepadu
         log("ERROR:", repr(e))
         log(traceback.format_exc())
         try:
-            os.startfile(str(log_path))  # otevřít log v Notepadu (Windows)
+            os.startfile(str(log_path))  # otevřít log v Notepadu
         except Exception:
             pass
         raise
@@ -361,18 +475,4 @@ def main():
         except Exception:
             pass
 
-if __name__ == "__main__":
-    try:
-        boot("starting EXE")
-        main()
-        boot("main() finished OK")
-    except SystemExit as e:
-        boot(f"SystemExit (argparse?): {e}")
-        raise
-    except Exception as e:
-        boot("CRASH: " + repr(e))
-        try:
-            boot(traceback.format_exc())
-        except Exception:
-            pass
         raise
