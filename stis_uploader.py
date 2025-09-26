@@ -759,6 +759,8 @@ def main():
                 page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
                 log("Online formulář načten:", page.url)
                 wait_online_ready(page, log)   # ← přidej tento řádek
+                log("Editor potvrzen jako 'ready' – URL:", page.url)
+
 
             except Exception:
                 if ("online_start.php" in page.url) and page.locator(".exception").count():
