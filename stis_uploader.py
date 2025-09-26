@@ -813,15 +813,28 @@ def main():
             if team.get("herna") and page.locator("input[name='zapis_herna']").count():
                 page.fill("input[name='zapis_herna']", str(team["herna"]))
                 log("Herna vyplněna:", team["herna"])
-            # čas začátku (sloupec v setupu např. 'začátek utkání' → u tebe mapováno na cfg_team['zacatek'])
-            set_start_time(page, cfg_team["zacatek"], log)
             
-            # vedoucí (sloupce 'vedoucí domácích' a 'vedoucí hostů' → mapováno na 'vedouci_domacich' / 'vedouci_hostu')
-            set_team_leaders(page, cfg_team.get("vedouci_domacich"), cfg_team.get("vedouci_hostu"), log)
+            # čas začátku (např. "19:00")
+            if team.get("zacatek"):
+                try:
+                    set_start_time(page, team["zacatek"], log)
+                except Exception as e:
+                    log("set_start_time failed:", repr(e))
             
-            # uložit a pokračovat
-            page.get_by_role("button", name="Uložit a pokračovat").click()
-            page.wait_for_load_state("domcontentloaded")
+            # vedoucí družstev
+            set_team_leaders(page, team.get("ved_dom"), team.get("ved_host"), log)
+            
+            # uložit a pokračovat na online formulář
+            log("Click 'Uložit a pokračovat'…")
+            if not click_save_and_continue(page):
+                raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
+            
+            # počkej na online editor
+            try:
+                page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
+            except Exception:
+                page.wait_for_selector("input[type='text']", timeout=10000)
+            log("Online formulář načten:", page.url)
             if team.get("zacatek"):
                 if page.locator("input[name='zapis_zacatek']").count():
                     page.fill("input[name='zapis_zacatek']", team["zacatek"])
