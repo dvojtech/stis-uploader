@@ -48,7 +48,7 @@ def _parse_hhmm(s: str) -> tuple[int, int]:
 
 def set_start_time(page, start_val, log, timeout_each=1500):
     """Vybere HH/MM z dropdownů i když mění jména/id (nejdřív známé selektory, pak heuristika)."""
-    hh, mm = _parse_hh_mm(start_val)
+    hh, mm = _parse_hhmm(start_val)
 
     tried = [
         ("select[name='zapis_zacatek_hod']", "select[name='zapis_zacatek_min']"),
@@ -800,7 +800,6 @@ def main():
     if not xlsx_path.exists():
         raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
 
-    # logger vedle XLSX
     log, log_file, log_path = make_logger(xlsx_path)
     log("==== stis_uploader start ====")
     log("XLSX:", xlsx_path)
@@ -808,176 +807,92 @@ def main():
     log("Headed:", getattr(args, "headed", True))
 
     try:
-        # 1) načti přihlášení + tým
-        user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
+        login, pwd, team = read_excel_config(xlsx_path, args.team)
         log("Login OK; team:", team["name"], "ID:", team["id"])
 
         headed = bool(getattr(args, "headed", True))
-        headless = not headed
 
         with sync_playwright() as p:
             ensure_pw_browsers(log)
-
-            # 2) spuštění prohlížeče (Chromium → Chrome → Edge)
-            log("Launching browser… headless =", headless)
-            browser = None
+            # --- spuštění prohlížeče
+            log("Launching browser… headless =", not headed)
             try:
-                browser = p.chromium.launch(headless=headless)
+                browser = p.chromium.launch(headless=not headed)
                 log("Launched: managed Chromium")
             except Exception as e1:
                 log("Chromium failed:", repr(e1), "→ trying channel=chrome")
                 try:
-                    browser = p.chromium.launch(channel="chrome", headless=headless)
+                    browser = p.chromium.launch(channel="chrome", headless=not headed)
                     log("Launched: channel=chrome")
                 except Exception as e2:
                     log("Chrome failed:", repr(e2), "→ trying channel=msedge")
-                    browser = p.chromium.launch(channel="msedge", headless=headless)
+                    browser = p.chromium.launch(channel="msedge", headless=not headed)
                     log("Launched: channel=msedge")
 
-            context = browser.new_context()
-            page = context.new_page()
+            ctx = browser.new_context()
+            page = ctx.new_page()
 
-            # 3) login
+            # --- login
             log("Navigating to login…")
-            page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
-                      wait_until="domcontentloaded")
-            page.fill("input[name='login']", user_login)
-            page.fill("input[name='heslo']",  user_pwd)
+            page.goto("https://registr.ping-pong.cz/htm/auth/login.php", wait_until="domcontentloaded")
+            page.fill("input[name='login']", login)
+            page.fill("input[name='heslo']",  pwd)
             page.locator("[name='send']").click()
             page.wait_for_load_state("domcontentloaded")
             log("Logged in.")
 
-            # 4) stránka družstva
+            # --- stránka družstva
             team_url = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
             log("Open team page:", team_url)
             page.goto(team_url, wait_until="domcontentloaded")
 
-            # 5) najdi vstup do formuláře (vložit/upravit)
+            # --- vstup do formuláře (vložit/upravit zápis)
             log("Hledám odkaz 'vložit/upravit zápis'…")
             if not open_match_form(page, log):
                 raise RuntimeError("Na stránce družstva jsem nenašel odkaz do formuláře.")
 
-            # 6) vyplň úvodní údaje (herna / začátek / vedoucí)
-            if team.get("herna") and page.locator("input[name='zapis_herna']").count():
-                page.fill("input[name='zapis_herna']", str(team["herna"]))
-                log("Herna vyplněna:", team["herna"])
-            
-            # čas začátku (např. "19:00")
-            if team.get("zacatek"):
-                try:
-                    set_start_time(page, team["zacatek"], log)
-                except Exception as e:
-                    log("set_start_time failed:", repr(e))
-            
-            # vedoucí družstev
-            set_team_leaders(page, team.get("ved_dom"), team.get("ved_host"), log)
-            
-            # uložit a pokračovat na online formulář
-            log("Click 'Uložit a pokračovat'…")
-            if not click_save_and_continue(page):
-                raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
-            
-            # počkej na online editor
-            try:
-                page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
-            except Exception:
-                page.wait_for_selector("input[type='text']", timeout=10000)
+            # --- pokud jsme na online_start.php → vyplň Herna/Začátek/Vedoucí a pokračuj
+            if "online_start.php" in page.url:
+                fill_start_form(
+                    page,
+                    herna   = str(team.get("herna")   or ""),
+                    zacatek = str(team.get("zacatek") or ""),
+                    ved_dom = str(team.get("ved_dom") or ""),
+                    ved_host= str(team.get("ved_host")or ""),
+                    log     = log
+                )
+            else:
+                # (už rozpracovaný zápis skočil rovnou do online.php)
+                log("Přeskočeno online_start – jsem rovnou na:", page.url)
+
+            # --- teď už MUSÍME být na online.php
             log("Online formulář načten:", page.url)
-            if team.get("zacatek"):
-                if page.locator("input[name='zapis_zacatek']").count():
-                    page.fill("input[name='zapis_zacatek']", team["zacatek"])
-                    log("Začátek (input) vyplněn:", team["zacatek"])
-                else:
-                    # pokus přes dvě <select> (hodina, minuta)
-                    try:
-                        hh, mm = team["zacatek"].split(":")
-                        sels = page.locator("select")
-                        if sels.count() >= 2:
-                            sels.nth(0).select_option(value=hh)
-                            sels.nth(1).select_option(value=mm)
-                            log("Začátek (selects) nastaven:", team["zacatek"])
-                    except Exception as e:
-                        log("Set start time via selects failed:", repr(e))
 
-            if team.get("ved_dom") and page.locator("select[name='id_domaci_vedouci']").count():
-                page.select_option("select[name='id_domaci_vedouci']", label=str(team["ved_dom"]))
-                log("Vedoucí domácích:", team["ved_dom"])
-
-            if team.get("ved_host") and page.locator("select[name='id_hoste_vedouci']").count():
-                page.select_option("select[name='id_hoste_vedouci']", label=str(team["ved_host"]))
-                log("Vedoucí hostů:", team["ved_host"])
-
-            # 7) Uložit a pokračovat (robustně)
-            log("Click 'Uložit a pokračovat'…")
-            clicked = False
-            # a) podle názvu tlačítka
-            try:
-                btn = page.get_by_role("button", name=re.compile(r"uložit.*pokračovat", re.I))
-                if btn.count():
-                    btn.first.click(timeout=5000)
-                    clicked = True
-            except Exception as e:
-                log("Button(by role) click failed:", repr(e))
-            # b) podle name='odeslat'
-            if not clicked:
-                try:
-                    sel = page.locator("input[name='odeslat'], button[name='odeslat']")
-                    if sel.count():
-                        sel.first.click(timeout=5000)
-                        clicked = True
-                except Exception as e:
-                    log("Button(name=odeslat) click failed:", repr(e))
-            # c) podle anchor textu
-            if not clicked:
-                try:
-                    a = page.locator("a:has-text('Uložit a pokračovat')")
-                    if a.count():
-                        a.first.click(timeout=5000)
-                        clicked = True
-                except Exception as e:
-                    log("Anchor(click) failed:", repr(e))
-
-            if not clicked:
-                raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
-
-            # 8) čekej na online formulář
-            try:
-                page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
-            except Exception:
-                # fallback: aspoň počkat na nějaké textové inputy
-                page.wait_for_selector("input[type='text']", timeout=10000)
-            log("Online formulář načten:", page.url)
-            
-           # vyplň data
+            # --- načti data z listu 'zdroj' a vyplň
             data = read_zdroj_data(xlsx_path)
             fill_online_from_zdroj(page, data, log, xlsx_path)
-            
-            # volitelné uložení
+
+            # volitelně uložit
             try:
                 page.get_by_role("button", name=re.compile(r"uložit\s*změny", re.I)).first.click(timeout=4000)
                 log("Kliknuto na 'Uložit změny'.")
             except Exception as e:
                 log("'Uložit změny' nenašlo/nekliklo:", repr(e))
-            
-            # ponech okno na vizuální kontrolu (pokud běží headed)
-            
-            # 9) vizuální dokončení
+
+            # nech prohlížeč otevřený pro vizuální kontrolu
             if headed:
                 log("Leaving browser open for manual finish.")
-                print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
                 while True:
                     time.sleep(1)
             else:
-                context.close()
+                ctx.close()
                 browser.close()
 
     except Exception as e:
         log("ERROR:", repr(e))
         log(traceback.format_exc())
-        try:
-            os.startfile(str(log_path))  # otevřít log v Notepadu
-        except Exception:
-            pass
+        try: os.startfile(str(log_path))
+        except Exception: pass
         raise
     finally:
         try:
@@ -986,7 +901,6 @@ def main():
         except Exception:
             pass
 
-        raise
 if __name__ == "__main__":
     boot("=== EXE start ===")
     try:
