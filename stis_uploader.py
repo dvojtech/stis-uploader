@@ -201,8 +201,14 @@ def read_zdroj_data(xlsx_path):
 def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     """
     Vyplní online formulář STIS podle skutečné struktury DOM.
-    log("fill_online_from_zdroj: start – záznamů v XLSX:", len(data or []))
+   
     """
+    log(
+        "fill_online_from_zdroj: start – singles:",
+        len((data or {}).get("singles", [])),
+        "double:",
+        "ano" if (data or {}).get("double") else "ne"
+    )
     try:
         wait_online_ready(page, log)
     except Exception:
