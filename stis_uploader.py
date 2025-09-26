@@ -626,6 +626,8 @@ def parse_args():
     p.set_defaults(headed=True)  # výchozí = viditelné okno
     return p.parse_args()
 
+# Nahraďte celou main() funkci tímto opraveným kódem:
+
 def main():
     args = parse_args()
     xlsx_path = Path(args.xlsx).resolve()
@@ -803,7 +805,6 @@ def main():
                     if attempt == max_attempts - 1:
                         raise RuntimeError("Nepodařilo se odeslat formulář ani po několika pokusech")
                     
-            
             # 8) Čekej na online editor
             try:
                 # Čekej buď na online.php nebo na přítomnost editovacích prvků
@@ -812,59 +813,53 @@ def main():
                     timeout=30000
                 )
                 log("Online editor dostupný na:", page.url)
+                
+                # 9) KONEČNĚ: Vyplň data ze zdroj listu
+                if zdroj_data:
+                    log("Začínám vyplňovat sestavy a sety...")
+                    fill_online_from_zdroj(page, zdroj_data, log, xlsx_path)
+                    log("Sestavy a sety vyplněny")
+                else:
+                    log("VAROVÁNÍ: Žádná data ze 'zdroj' listu k vyplnění")
+                    
             except Exception as e:
                 log("Problém s online editorem:", repr(e))
                 if xlsx_path:
                     _dom_dump(page, xlsx_path, log)
                 raise
             
-            # 9) KONEČNĚ: Vyplň data ze zdroj listu
-            if zdroj_data:
-                log("Začínám vyplňovat sestavy a sety...")
-                fill_online_from_zdroj(page, zdroj_data, log, xlsx_path)
-                log("Sestavy a sety vyplněny")
-            else:
-                log("VAROVÁNÍ: Žádná data ze 'zdroj' listu k vyplnění")
-
+            # 10) UPRAVENÉ: Okno zůstane otevřené pro ruční kontrolu a zavření
+            if headed:
+                log("=" * 60)
+                log("HOTOVO! Okno prohlížeče zůstává otevřené.")
+                log("Zkontrolujte vyplněná data a ručně zavřete okno prohlížeče.")
+                log("Program se ukončí až po zavření okna.")
+                log("=" * 60)
                 
-        except Exception as e:
-            log("Problém s online editorem:", repr(e))
-            if xlsx_path:
-                _dom_dump(page, xlsx_path, log)
-            raise
-        
-        # 10) UPRAVENÉ: Okno zůstane otevřené pro ruční kontrolu a zavření
-        if headed:
-            log("=" * 60)
-            log("HOTOVO! Okno prohlížeče zůstává otevřené.")
-            log("Zkontrolujte vyplněná data a ručně zavřete okno prohlížeče.")
-            log("Program se ukončí až po zavření okna.")
-            log("=" * 60)
-            
-            try:
-                # Čeká, dokud uživatel ručně nezavře okno prohlížeče
-                page.wait_for_event("close", timeout=0)  # timeout=0 = nekonečné čekání
-                log("Okno prohlížeče bylo zavřeno uživatelem.")
-            except Exception as e:
-                log("Čekání na zavření okna skončilo:", repr(e))
-            finally:
-                try: 
-                    context.close()
-                    log("Browser context uzavřen.")
-                except Exception: 
-                    pass
-                try: 
-                    browser.close()
-                    log("Browser uzavřen.")
-                except Exception: 
-                    pass
-        else:
-            # V headless režimu okno rovnou zavřeme
-            log("Headless režim - zavírám browser automaticky.")
-            try: context.close()
-            except Exception: pass
-            try: browser.close() 
-            except Exception: pass
+                try:
+                    # Čeká, dokud uživatel ručně nezavře okno prohlížeče
+                    page.wait_for_event("close", timeout=0)  # timeout=0 = nekonečné čekání
+                    log("Okno prohlížeče bylo zavřeno uživatelem.")
+                except Exception as e:
+                    log("Čekání na zavření okna skončilo:", repr(e))
+                finally:
+                    try: 
+                        context.close()
+                        log("Browser context uzavřen.")
+                    except Exception: 
+                        pass
+                    try: 
+                        browser.close()
+                        log("Browser uzavřen.")
+                    except Exception: 
+                        pass
+            else:
+                # V headless režimu okno rovnou zavřeme
+                log("Headless režim - zavírám browser automaticky.")
+                try: context.close()
+                except Exception: pass
+                try: browser.close() 
+                except Exception: pass
 
     except Exception as e:
         log("ERROR:", repr(e))
