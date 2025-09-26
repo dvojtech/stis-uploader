@@ -328,15 +328,46 @@ def norm(x) -> str:
     return s
 
 def as_time_txt(v):
-    if v is None: return None
-    try:
-        if isinstance(v, (int, float)):
-            total = round(float(v) * 24 * 60)
-            return f"{total//60:02d}:{total%60:02d}"
-    except: pass
-    s = str(v).strip()
-    m = re.match(r"^(\d{1,2}):(\d{2})$", s)
-    return f"{int(m.group(1)):02d}:{int(m.group(2)):02d}" if m else None
+    import re, datetime
+    if v is None:
+        return None
+
+    # 1) Excel přes openpyxl často vrátí datetime.time
+    if isinstance(v, datetime.time):
+        return f"{v.hour:02d}:{v.minute:02d}"
+
+    # 2) Excel čas jako frakce dne (0.0–1.0)
+    if isinstance(v, (int, float)):
+        if 0 <= v < 2:  # tolerantní (někdy bývá 1.0 + zlomky)
+            total_minutes = int(round((v % 1) * 24 * 60))
+            hh = (total_minutes // 60) % 24
+            mm = total_minutes % 60
+            return f"{hh:02d}:{mm:02d}"
+
+    # 3) Textové varianty: "19", "19:0", "19:00", "19.00", "19 00", "7 pm"
+    if isinstance(v, str):
+        s = v.strip().lower()
+
+        # "7 pm", "7:30 am"
+        m = re.match(r'^(\d{1,2})(?::(\d{1,2}))?\s*(am|pm)$', s)
+        if m:
+            h = int(m.group(1)); m2 = int(m.group(2) or 0)
+            ap = m.group(3)
+            if ap == 'pm' and h != 12: h += 12
+            if ap == 'am' and h == 12: h = 0
+            if 0 <= h <= 23 and 0 <= m2 <= 59:
+                return f"{h:02d}:{m2:02d}"
+
+        # "19", "19:0", "19:00", "19.00", "19 00", "19,00"
+        m = re.match(r'^(\d{1,2})[ :\.\,h]?(\d{0,2})$', s)
+        if m:
+            h = int(m.group(1))
+            m2 = int(m.group(2)) if m.group(2) else 0
+            if 0 <= h <= 23 and 0 <= m2 <= 59:
+                return f"{h:02d}:{m2:02d}"
+
+    return None
+
 
 def get_setup_sheet(wb):
     """Najdi list 'setup' case-insensitive, jinak vrať první list."""
@@ -628,47 +659,53 @@ def main():
                 page.fill("input[name='zapis_herna']", str(team["herna"]))
                 log("Herna vyplněna:", team["herna"])
 
-            # OPRAVENÉ vyplnění času pomocí dvou select elementů
-            if team.get("zacatek"):
-                # Začátek utkání: 2× <select> (hodiny/minuty) – vždy nastav, i když v sešitu chybí
-                start_txt = (team.get("zacatek") or "19:00").strip()
-                try:
-                    hh, mm = start_txt.split(":")
-                    if page.locator("select[name='zapis_zacatek_hodiny']").count():
-                        page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
-                        log(f"Hodina nastavena: {int(hh):02d}")
-                    if page.locator("select[name='zapis_zacatek_minuty']").count():
-                        page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
-                        log(f"Minuta nastavena: {int(mm):02d}")
-                    # vynutíme 'change' – STIS to někdy vyžaduje
-                    page.click("body")
-                    log("Začátek nastaven:", f"{int(hh):02d}:{int(mm):02d}")
-                except Exception as e:
-                    log("Set start time failed:", repr(e))
-
-            # OPRAVENÉ vyplnění vedoucích pomocí autocomplete inputů
-            if team.get("ved_dom"):
-                try:
-                    ved_input = page.locator("input[name='id_domaci_vedoucitext']")
-                    if ved_input.count():
-                        ved_input.fill(str(team["ved_dom"]))
-                        page.keyboard.press("Tab")  # Aktivace autocomplete
-                        page.wait_for_timeout(500)
+          
+            # Začátek utkání: 2× <select> (hodiny/minuty) – vždy nastav, i když v sešitu chybí
+            start_txt = (team.get("zacatek") or "19:00").strip()
+            try:
+                hh, mm = start_txt.split(":")
+                if page.locator("select[name='zapis_zacatek_hodiny']").count():
+                    page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
+                    log(f"Hodina nastavena: {int(hh):02d}")
+                if page.locator("select[name='zapis_zacatek_minuty']").count():
+                    page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
+                    log(f"Minuta nastavena: {int(mm):02d}")
+                page.click("body")  # vyvolá 'change'
+                log("Začátek nastaven:", f"{int(hh):02d}:{int(mm):02d}")
+            except Exception as e:
+                log("Set start time failed:", repr(e))
+            
+            # Vedoucí – vyplň jen když je pole povolené a prázdné
+            try:
+                vi = page.locator("input[name='id_domaci_vedoucitext']")
+                if vi.count():
+                    # když je disabled nebo už má hodnotu, jen zaloguj a nepřepisuj
+                    val = (vi.get_attribute("value") or "").strip()
+                    if vi.is_disabled() or val:
+                        log("Vedoucí domácích (locked/filled):", val or "(prázdné)")
+                    elif team.get("ved_dom"):
+                        vi.fill(str(team["ved_dom"]))
+                        page.keyboard.press("Tab")
+                        page.wait_for_timeout(300)
                         log("Vedoucí domácích:", team["ved_dom"])
-                except Exception as e:
-                    log("Vedoucí domácích selhal:", repr(e))
-
-            if team.get("ved_host"):
-                try:
-                    ved_input = page.locator("input[name='id_hoste_vedoucitext']")
-                    if ved_input.count():
-                        ved_input.fill(str(team["ved_host"]))
-                        page.keyboard.press("Tab")  # Aktivace autocomplete
-                        page.wait_for_timeout(500)
+            except Exception as e:
+                log("Vedoucí domácích selhal:", repr(e))
+            
+            try:
+                vi = page.locator("input[name='id_hoste_vedoucitext']")
+                if vi.count():
+                    val = (vi.get_attribute("value") or "").strip()
+                    if vi.is_disabled() or val:
+                        log("Vedoucí hostů (locked/filled):", val or "(prázdné)")
+                    elif team.get("ved_host"):
+                        vi.fill(str(team["ved_host"]))
+                        page.keyboard.press("Tab")
+                        page.wait_for_timeout(300)
                         log("Vedoucí hostů:", team["ved_host"])
-                except Exception as e:
-                    log("Vedoucí hostů selhal:", repr(e))
-
+            except Exception as e:
+                log("Vedoucí hostů selhal:", repr(e))
+                
+            
             # 7) Uložit a pokračovat (robustně)
             log("Click 'Uložit a pokračovat'…")
             clicked = False
@@ -697,13 +734,12 @@ def main():
             if not clicked:
                 raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
 
-           # 8) Po submitu – nejprve kontrola serverové chyby s časem
+            # 8) Po submitu – nejprve kontrola serverové chyby s časem
+            # Po submitu – kontrola chyby s časem
             page.wait_for_load_state("domcontentloaded")
             if page.locator(".exception:has-text('není vyplněn začátek utkání')").count():
                 log("Server hlásí: není vyplněn začátek utkání → přenastavím a zkusím znovu…")
                 try:
-                    # přepoužij stejné hh/mm, případně znovu vypočti:
-                    # hh, mm = (team.get("zacatek") or "18:30").split(":")
                     page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
                     page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
                     page.click("body")
@@ -712,14 +748,13 @@ def main():
                     log("Re-submit selhal:", repr(e))
             
             # 9) Čekej na online editor (URL /online.php?u=…)
+            # Čekání na online editor
             try:
                 page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
             except Exception:
-                # Pokud jsme stále na online_start a je tam .exception, řekni to nahlas
                 if ("online_start.php" in page.url) and page.locator(".exception").count():
                     log("Zůstal jsem na online_start.php s chybou.")
                     raise RuntimeError("Server hlásí chybu na úvodním formuláři (pravděpodobně čas).")
-                # Fallback: aspoň počkat na nějaké textové inputy
                 page.wait_for_selector("input[type='text']", timeout=10000)
             
             log("Online formulář načten:", page.url)
