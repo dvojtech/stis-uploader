@@ -23,6 +23,24 @@ ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
+
+def _use_bundled_ms_playwright(log):
+    """
+    Když je EXE postavené s --add-data "ms-playwright;ms-playwright",
+    nastavíme PLAYWRIGHT_BROWSERS_PATH na rozbalenou složku.
+    Vrací True, pokud jsme cestu nastavili.
+    """
+    try:
+        base = getattr(sys, "_MEIPASS", None) or os.path.dirname(sys.executable)
+        cand = os.path.join(base, "ms-playwright")
+        if os.path.isdir(cand):
+            os.environ["PLAYWRIGHT_BROWSERS_PATH"] = cand
+            log("Using bundled ms-playwright at:", cand)
+            return True
+    except Exception as e:
+        log("Bundled ms-playwright detection failed:", repr(e))
+    return False
+
 def wait_online_ready(page, log, timeout=25000):
     """
     Počká na načtení online editoru.
@@ -559,6 +577,9 @@ def main():
 
         headed = bool(getattr(args, "headed", True))
         headless = not headed
+
+        # nasměruj Playwright na přibalené prohlížeče (pokud jsou)
+        _used_bundled = _use_bundled_ms_playwright(log)
 
         with sync_playwright() as p:
             ensure_pw_browsers(log)
