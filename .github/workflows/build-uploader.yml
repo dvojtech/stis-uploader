@@ -38,7 +38,8 @@ jobs:
           if (Test-Path $src) { Copy-Item -Recurse -Force $src ms-playwright }
 
       - name: Build EXE
-        run: pyinstaller --onefile --noconsole --name stis-uploader --collect-all playwright --add-data "ms-playwright;ms-playwright" stis_uploader.py
+        run: |
+          pyinstaller --onefile --name stis-uploader --console stis_uploader.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
