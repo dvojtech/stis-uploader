@@ -3,7 +3,6 @@ import argparse, os, re, sys, time
 import unicodedata
 import traceback
 import ctypes
-import json, time
 from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
@@ -23,67 +22,6 @@ BOOT_FILES = [
 ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
-
-def ensure_pw_browsers(log):
-    """
-    Zajistí instalaci Playwright prohlížečů (Chromium).
-    Funguje i z PyInstaller EXE.
-    """
-    try:
-        # rychlá detekce common umístění
-        base = os.path.expanduser(r"~\AppData\Local\ms-playwright") if os.name == "nt" \
-               else os.path.expanduser("~/.cache/ms-playwright")
-        if os.path.isdir(base) and any(os.scandir(base)):
-            log("Playwright browsers OK:", base)
-            return
-    except Exception:
-        pass
-
-    log("Playwright browsers missing → installing Chromium…")
-    try:
-        from playwright.__main__ import main as pw_main
-        pw_main(["install", "chromium"])
-        log("Chromium installed.")
-    except Exception as e:
-        log("Playwright install failed:", repr(e))
-        raise RuntimeError(
-            "Nepodařilo se nainstalovat Playwright prohlížeče. "
-            "Spusť to znovu, nebo jednorázově ručně: 'playwright install chromium'."
-        )
-
-
-def ensure_playwright_browsers(log):
-    """
-    Zajistí, že jsou nainstalované Playwright prohlížeče (Chromium).
-    Bez Pythonu, funguje i z PyInstaller EXE.
-    """
-    import os, sys
-    base = os.path.expanduser(r"~\AppData\Local\ms-playwright") if os.name == "nt" \
-           else os.path.expanduser("~/.cache/ms-playwright")
-
-    try:
-        need_install = not os.path.isdir(base) or not any(os.scandir(base))
-    except Exception:
-        need_install = True
-
-    if not need_install:
-        log("Playwright browsers OK:", base)
-        return
-
-    log("Playwright browsers missing → installing Chromium …")
-    try:
-        # Oficiální „playwright install chromium“ přes jejich entrypoint:
-        from playwright.__main__ import main as pw_main
-        pw_main(["install", "chromium"])
-        log("Chromium installed.")
-    except Exception as e:
-        log("Playwright install failed:", repr(e))
-        raise RuntimeError(
-            "Nepodařilo se nainstalovat Playwright prohlížeče. "
-            "Zkuste spustit EXE znovu, popř. běžte jednou ručně: "
-            "playwright install chromium"
-        )
-
 
 def wait_online_ready(page, log, timeout=25000):
     """
@@ -558,14 +496,19 @@ def read_excel_config(xlsx_path: Path, team_name: str):
             def getcol(key):
                 c = idx.get(key)
                 return setup.cell(r, c).value if c else None
+            raw_z = getcol("zacatek")
+            raw_k = getcol("konec")
             team = {
                 "name":    str(nm).strip(),
                 "id":      str(getcol("id") or "").strip(),
                 "ved_dom": getcol("ved_dom"),
                 "ved_host":getcol("ved_host"),
                 "herna":   getcol("herna"),
-                "zacatek": as_time_txt(getcol("zacatek")),
-                "konec":   as_time_txt(getcol("konec")),
+                # NOVÉ: uchovej RAW hodnoty + parsed řetězec HH:MM
+                "zacatek_raw": raw_z,
+                "konec_raw":   raw_k,
+                "zacatek":     as_time_txt(raw_z),
+                "konec":       as_time_txt(raw_k),
             }
             break
         r += 1
@@ -584,97 +527,10 @@ def read_excel_config(xlsx_path: Path, team_name: str):
 
     return login, pwd, team
 
-def inspect_xlsx(xlsx_path: Path, team_name: str, log):
-    """
-    Diagnostika vstupu: ukáže co přesně čteme z XLSX (RAW vs. parsované hodnoty).
-    Vytvoří také sidecar JSON soubor vedle XLSX.
-    """
-    from openpyxl import load_workbook
-
-    # co by uploader reálně použil
-    login, pwd, team = read_excel_config(xlsx_path, team_name)
-
-    # současně si vytáhneme „RAW“ buňky z listu s Teams
-    wb = load_workbook(xlsx_path, data_only=False)
-    setup, hdr_row = find_teams_header_anywhere(wb)  # už máš v souboru
-    idx = {}
-    max_c = min(80, setup.max_column or 0)
-    for c in range(1, max_c + 1):
-        h = norm(setup.cell(hdr_row, c).value or "")
-        if ("druzstvo" in h) and ("id" not in h) and ("vedouci" not in h):
-            idx["name"] = c
-        if (("druzstvoid" in h) or ("id_druzstva" in h) or ("iddruzstva" in h) or (h == "id")) and ("vedouci" not in h):
-            idx["id"] = c
-        if "vedoucidomacich" in h or ("vedouci" in h and "host" not in h):
-            idx["ved_dom"] = c
-        if "vedoucihostu" in h or ("vedouci" in h and "host" in h):
-            idx["ved_host"] = c
-        if "herna" in h:
-            idx["herna"] = c
-        if "zacatekut" in h or "zacatek" in h:
-            idx["zacatek"] = c
-        if "konecutkani" in h or "konec" in h:
-            idx["konec"] = c
-
-    raw = {}
-    # najdi řádek týmu
-    r = hdr_row + 1
-    while r <= (setup.max_row or 0):
-        nm = setup.cell(r, idx["name"]).value
-        if nm is None or str(nm).strip() == "":
-            break
-        if str(nm).strip().lower() == team_name.strip().lower():
-            def getraw(key):
-                c = idx.get(key)
-                return setup.cell(r, c).value if c else None
-            raw = {
-                "name":    getraw("name"),
-                "id":      getraw("id"),
-                "ved_dom": getraw("ved_dom"),
-                "ved_host":getraw("ved_host"),
-                "herna":   getraw("herna"),
-                "zacatek_raw": getraw("zacatek"),
-                "konec_raw":   getraw("konec"),
-            }
-            break
-        r += 1
-
-    # vytvoř výstup: RAW vs. parsed
-    out = {
-        "xlsx": str(xlsx_path),
-        "team_query": team_name,
-        "login": {"user": str(login), "pwd_present": bool(pwd)},
-        "team_parsed": team,  # to co uploader skutečně použije
-        "team_raw": raw,      # co je v buňkách
-        "time_debug": {
-            "zacatek_raw": raw.get("zacatek_raw"),
-            "zacatek_parsed": team.get("zacatek"),
-            "konec_raw": raw.get("konec_raw"),
-            "konec_parsed": team.get("konec"),
-        }
-    }
-
-    # log + JSON soubor vedle XLSX
-    log("=== INSPECT XLSX ===")
-    log("Login user:", out["login"]["user"], "pwd_present:", out["login"]["pwd_present"])
-    log("Team RAW:", raw)
-    log("Team PARSED:", team)
-    log("Time RAW/PARSED:", out["time_debug"])
-
-    dump_path = xlsx_path.with_suffix(".parsed.json")
-    try:
-        with open(dump_path, "w", encoding="utf-8") as f:
-            json.dump(out, f, ensure_ascii=False, indent=2, default=str)
-        log("Uloženo:", dump_path)
-    except Exception as e:
-        log("Uložení JSON selhalo:", repr(e))
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--xlsx", required=True, help="plná cesta k XLSX")
     p.add_argument("--team", required=True, help="název družstva (sloupec 'Družstvo')")
-    p.add_argument("--inspect", action="store_true",
-                   help="pouze načti data z XLSX, vypiš RAW a parsované hodnoty a skonči")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--headed",  dest="headed",  action="store_true",  help="viditelný prohlížeč")
     g.add_argument("--headless", dest="headed", action="store_false", help="bez UI")
@@ -694,41 +550,20 @@ def main():
     log("Team:", args.team)
     log("Headed:", getattr(args, "headed", True))
 
-    # >>> DIAGNOSTIKA BEZ PROHLÍŽEČE <<<
-    if getattr(args, "inspect", False):
-        try:
-            inspect_xlsx(xlsx_path, args.team, log)
-            log("INSPECT dokončeno – žádný upload neproběhl.")
-        except Exception as e:
-            log("INSPECT ERROR:", repr(e))
-            log(traceback.format_exc())
-            try:
-                os.startfile(str(log_path))
-            except Exception:
-                pass
-            raise
-        finally:
-            try:
-                log("==== stis_uploader end ====")
-                log_file.close()
-            except Exception:
-                pass
-        return
-    # <<< konec diagnostiky >>>
-
     try:
         # 1) načti přihlášení + tým
         user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
-        log("Login OK; team:", team.get("name"), "ID:", team.get("id"))
+        log("Login OK; team:", team["name"], "ID:", team["id"])
+        log("Time (XLSX raw → parsed):", repr(team.get("zacatek_raw")), "→", team.get("zacatek"))
+
 
         headed = bool(getattr(args, "headed", True))
         headless = not headed
 
-        # 2) Playwright prohlížeče (auto-install jednou)
-        ensure_pw_browsers(log)
-
         with sync_playwright() as p:
-            # 3) spuštění prohlížeče (Chromium → Chrome → Edge)
+            ensure_pw_browsers(log)
+
+            # 2) spuštění prohlížeče (Chromium → Chrome → Edge)
             log("Launching browser… headless =", headless)
             browser = None
             try:
@@ -747,82 +582,87 @@ def main():
             context = browser.new_context()
             page = context.new_page()
 
-            # 4) login
+            # 3) login
             log("Navigating to login…")
-            page.goto("https://registr.ping-pong.cz/htm/auth/login.php", wait_until="domcontentloaded")
+            page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
+                      wait_until="domcontentloaded")
             page.fill("input[name='login']", user_login)
             page.fill("input[name='heslo']",  user_pwd)
             page.locator("[name='send']").click()
             page.wait_for_load_state("domcontentloaded")
             log("Logged in.")
 
-            # 5) stránka družstva
+            # 4) stránka družstva
             team_url = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
             log("Open team page:", team_url)
             page.goto(team_url, wait_until="domcontentloaded")
 
-            # 6) najdi vstup do formuláře (vložit/upravit)
+            # 5) najdi vstup do formuláře (vložit/upravit)
             log("Hledám odkaz 'vložit/upravit zápis'…")
             if not open_match_form(page, log):
                 raise RuntimeError("Na stránce družstva jsem nenašel odkaz do formuláře.")
 
-            # 7) vyplň úvodní údaje (herna / začátek / vedoucí)
+            # 6) vyplň úvodní údaje (herna / začátek / vedoucí)
             if team.get("herna") and page.locator("input[name='zapis_herna']").count():
                 page.fill("input[name='zapis_herna']", str(team["herna"]))
                 log("Herna vyplněna:", team["herna"])
 
-            # Začátek utkání: 2x <select> (hodiny/minuty)
-            # vezmi parsed čas, případně default
-            start_txt = (team.get("zacatek") or "18:30").strip()
-            try:
-                hh, mm = start_txt.split(":")
-                if page.locator("select[name='zapis_zacatek_hodiny']").count():
-                    page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
-                    log(f"Hodina nastavena: {int(hh):02d}")
-                if page.locator("select[name='zapis_zacatek_minuty']").count():
-                    page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
-                    log(f"Minuta nastavena: {int(mm):02d}")
-                # trigger change
-                page.click("body")
-                log("Začátek nastaven:", f"{int(hh):02d}:{int(mm):02d}")
-            except Exception as e:
-                log("Set start time failed:", repr(e))
+            # OPRAVENÉ vyplnění času pomocí dvou select elementů
+            if team.get("zacatek"):
+                # Začátek utkání: 2× <select> (hodiny/minuty) – vždy nastav, i když v sešitu chybí
+                start_txt = (team.get("zacatek") or "19:00").strip()
+                try:
+                    hh, mm = start_txt.split(":")
+                    if page.locator("select[name='zapis_zacatek_hodiny']").count():
+                        page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
+                        log(f"Hodina nastavena: {int(hh):02d}")
+                    if page.locator("select[name='zapis_zacatek_minuty']").count():
+                        page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
+                        log(f"Minuta nastavena: {int(mm):02d}")
+                    # vynutíme 'change' – STIS to někdy vyžaduje
+                    page.click("body")
+                    log("Začátek nastaven:", f"{int(hh):02d}:{int(mm):02d}")
+                except Exception as e:
+                    log("Set start time failed:", repr(e))
 
-            # Vedoucí – autocomplete
-            try:
-                if team.get("ved_dom"):
-                    vi = page.locator("input[name='id_domaci_vedoucitext']")
-                    if vi.count():
-                        vi.fill(str(team["ved_dom"]))
-                        page.keyboard.press("Tab")
-                        page.wait_for_timeout(400)
+            # OPRAVENÉ vyplnění vedoucích pomocí autocomplete inputů
+            if team.get("ved_dom"):
+                try:
+                    ved_input = page.locator("input[name='id_domaci_vedoucitext']")
+                    if ved_input.count():
+                        ved_input.fill(str(team["ved_dom"]))
+                        page.keyboard.press("Tab")  # Aktivace autocomplete
+                        page.wait_for_timeout(500)
                         log("Vedoucí domácích:", team["ved_dom"])
-            except Exception as e:
-                log("Vedoucí domácích selhal:", repr(e))
+                except Exception as e:
+                    log("Vedoucí domácích selhal:", repr(e))
 
-            try:
-                if team.get("ved_host"):
-                    vi = page.locator("input[name='id_hoste_vedoucitext']")
-                    if vi.count():
-                        vi.fill(str(team["ved_host"]))
-                        page.keyboard.press("Tab")
-                        page.wait_for_timeout(400)
+            if team.get("ved_host"):
+                try:
+                    ved_input = page.locator("input[name='id_hoste_vedoucitext']")
+                    if ved_input.count():
+                        ved_input.fill(str(team["ved_host"]))
+                        page.keyboard.press("Tab")  # Aktivace autocomplete
+                        page.wait_for_timeout(500)
                         log("Vedoucí hostů:", team["ved_host"])
-            except Exception as e:
-                log("Vedoucí hostů selhal:", repr(e))
+                except Exception as e:
+                    log("Vedoucí hostů selhal:", repr(e))
 
-            # 8) Uložit a pokračovat (robustně)
+            # 7) Uložit a pokračovat (robustně)
             log("Click 'Uložit a pokračovat'…")
             clicked = False
+            
+            # Zkus najít tlačítko "Uložit a pokračovat" podle name atributu z HTML dumpu
             try:
-                btn = page.locator("input[name='odeslat']")
+                btn = page.locator("input[name='odeslat']")  # "Uložit a pokračovat" má name="odeslat"
                 if btn.count():
                     btn.click(timeout=5000)
                     clicked = True
                     log("Kliknuto na 'Uložit a pokračovat' (name=odeslat)")
             except Exception as e:
                 log("Button(name=odeslat) click failed:", repr(e))
-
+            
+            # Fallback podle value atributu
             if not clicked:
                 try:
                     btn = page.locator("input[value*='pokračovat']")
@@ -836,40 +676,35 @@ def main():
             if not clicked:
                 raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
 
-            # 9) Po submitu: zkus detekovat případnou chybu (typicky 'není vyplněn začátek utkání')
+           # 8) Po submitu – nejprve kontrola serverové chyby s časem
             page.wait_for_load_state("domcontentloaded")
             if page.locator(".exception:has-text('není vyplněn začátek utkání')").count():
-                log("Server hlásí: není vyplněn začátek utkání → opravím a zkusím znovu…")
-                # přenastav a submit znovu
+                log("Server hlásí: není vyplněn začátek utkání → přenastavím a zkusím znovu…")
                 try:
+                    # přepoužij stejné hh/mm, případně znovu vypočti:
+                    # hh, mm = (team.get("zacatek") or "18:30").split(":")
                     page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
                     page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
                     page.click("body")
-                except Exception as e:
-                    log("Re-set start time failed:", repr(e))
-                try:
                     page.locator("input[name='odeslat']").click(timeout=5000)
                 except Exception as e:
-                    log("Re-submit failed:", repr(e))
-
-            # 10) Čekej na online editor (URL /online.php?u=…)
+                    log("Re-submit selhal:", repr(e))
+            
+            # 9) Čekej na online editor (URL /online.php?u=…)
             try:
                 page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
             except Exception:
-                # Pokud jsme stále na online_start a je tam .exception, dej jasné hlášení
+                # Pokud jsme stále na online_start a je tam .exception, řekni to nahlas
                 if ("online_start.php" in page.url) and page.locator(".exception").count():
                     log("Zůstal jsem na online_start.php s chybou.")
-                    raise RuntimeError("Server hlásí chybu na úvodním formuláři (zřejmě čas).")
-                # fallback: čekej aspoň na textové inputy
+                    raise RuntimeError("Server hlásí chybu na úvodním formuláři (pravděpodobně čas).")
+                # Fallback: aspoň počkat na nějaké textové inputy
                 page.wait_for_selector("input[type='text']", timeout=10000)
-
+            
             log("Online formulář načten:", page.url)
 
-            # 11) vyplň data
-            data = read_zdroj_data(xlsx_path)
-            fill_online_from_zdroj(page, data, log, xlsx_path)
-
-            # 12) vizuální dokončení
+            
+            # 10) vizuální dokončení
             if headed:
                 log("Leaving browser open for manual finish.")
                 print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
