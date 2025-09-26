@@ -1,5 +1,8 @@
 # stis_uploader.py
-import argparse, os, re, sys, time, unicodedata, traceback, ctypes
+import argparse, os, re, sys, time
+import unicodedata
+import traceback
+import ctypes
 from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
@@ -10,284 +13,111 @@ from playwright.sync_api import TimeoutError as PwTimeout
 EXE_DIR = Path(sys.argv[0]).resolve().parent
 # kam určitě umíme zapsat
 TEMP_DIR = Path(os.environ.get("TEMP", str(EXE_DIR)))
-# cesty pro „boot“ log (zapisujeme na obě místa)
+# cesty pro "boot" log (zapisujeme na obě místa)
 BOOT_FILES = [
     TEMP_DIR / "stis_boot.log",
     EXE_DIR / "stis_boot.log",
 ]
 # --- konfigurace mapování řádků v listu "zdroj" ---
 ZDROJ_SHEET             = "zdroj"
-ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I–M = sety)
+ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
-
-def _log(msg):
-    # bezpecné logování do konzole i souboru (pokud máš vlastní log funkci, klidně ji zde použij)
-    try:
-        print(msg, flush=True)
-    except Exception:
-        pass
-
-def _parse_hhmm(s: str) -> tuple[int, int]:
-    """Vrátí (hod, min) z '19:00', '19.00', '19 00', '19', …  Minuty zaokrouhlí na 5."""
-    if not s:
-        return (0, 0)
-    txt = str(s).strip()
-    m = re.findall(r"\d+", txt)
-    if not m:
-        return (0, 0)
-    if len(m) == 1:
-        hh, mm = int(m[0]), 0
-    else:
-        hh, mm = int(m[0]), int(m[1])
-    hh = max(0, min(23, hh))
-    mm = max(0, min(59, mm))
-    # STIS nabízí jen 00,05,10,…55 → zaokrouhlíme na nejbližších 5
-    mm = int(round(mm / 5) * 5) % 60
-    return (hh, mm)
-
-def set_start_time(page, start_val, log, timeout_each=1500):
-    """Vybere HH/MM z dropdownů i když mění jména/id (nejdřív známé selektory, pak heuristika)."""
-    hh, mm = _parse_hhmm(start_val)
-
-    tried = [
-        ("select[name='zapis_zacatek_hod']", "select[name='zapis_zacatek_min']"),
-        ("#zapis_zacatek_hod", "#zapis_zacatek_min"),
-        ("select[name='zacatek_hod']", "select[name='zacatek_min']"),
-    ]
-    for hs, ms in tried:
-        h = page.locator(hs); m = page.locator(ms)
-        try:
-            if h.count() and m.count():
-                h.first.wait_for(state="visible", timeout=timeout_each)
-                m.first.wait_for(state="visible", timeout=timeout_each)
-                for tgt, val in ((h.first, hh), (m.first, mm)):
-                    try: tgt.select_option(label=val)
-                    except Exception: tgt.select_option(value=val)
-                log(f"Začátek nastaven přes {hs}/{ms} → {hh}:{mm}")
-                return
-        except PwTimeout:
-            pass
-
-    # heuristika: najdi dvě <select> s ~24 a ~60 možnostmi
-    cand_h, cand_m = [], []
-    for i in range(page.locator("select").count()):
-        s = page.locator("select").nth(i)
-        try:
-            n = s.evaluate("el => el.options ? el.options.length : 0")
-            if 22 <= n <= 26: cand_h.append(s)
-            elif 57 <= n <= 63: cand_m.append(s)
-        except Exception:
-            continue
-    if cand_h and cand_m:
-        h, m = cand_h[0], cand_m[0]
-        h.wait_for(state="visible", timeout=timeout_each)
-        m.wait_for(state="visible", timeout=timeout_each)
-        for tgt, val in ((h, hh), (m, mm)):
-            try: tgt.select_option(label=val)
-            except Exception: tgt.select_option(value=val)
-        log(f"Začátek nastaven heuristicky → {hh}:{mm}")
-        return
-
-    raise RuntimeError("Nepodařilo se nastavit 'Začátek utkání' – nenašel jsem časové <select>.")
-
-def fill_start_form(page, herna: str, zacatek: str, ved_dom: str, ved_host: str, log):
-    """Vyplní úvodní formulář (online_start.php) a přejde na online.php."""
-    # Herna (textové pole)
-    if herna:
-        page.locator("input[name='zapis_herna']").fill(herna)
-        log(f"Herna vyplněna: {herna}")
-
-    # Začátek utkání – dvě <select> s name='zapis_zacatek_hodiny' / '..._minuty'
-    hh, mm = _parse_hhmm(zacatek)
-    page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
-    page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
-    log(f"Začátek vyplněn: {hh:02d}:{mm:02d}")
-
-    # Vedoucí družstev – použijeme „fallback“: doplníme text do viditelných inputů
-    if ved_dom:
-        page.locator("input[name='id_domaci_vedoucitext']").fill(ved_dom)
-        log(f"Vedoucí 'Domácí:' → {ved_dom}")
-    if ved_host:
-        page.locator("input[name='id_hoste_vedoucitext']").fill(ved_host)
-        log(f"Vedoucí 'Hosté:' → {ved_host}")
-
-    # Uložit a pokračovat
-    page.locator("input[name='odeslat']").click()
-
-    # Po odeslání buď zůstaneme na online_start.php (chyba), nebo se přejde na online.php
-    # Nejprve krátce počkáme na případnou chybovou hlášku:
-    page.wait_for_load_state("networkidle")
-    url = page.url
-    if "online_start.php" in url:
-        # Zkusíme přečíst případnou chybu
-        err = page.locator(".exception").first
-        if err.is_visible():
-            log(f"Po odeslání zůstávám na startu – hláška: {err.inner_text()}")
-        else:
-            log("Po odeslání zůstávám na startu – bez hlášky.")
-        # Abychom nepokračovali do části pro online.php:
-        raise RuntimeError("Nepodařilo se přejít na online formulář (zkontroluj vyplnění času).")
-
-    # Jsme na online.php – ještě počkáme, až se objeví blok s utkáním
-    page.wait_for_selector("#zapis .event", timeout=25000)
-def _fill_input_by_names_or_label_row(page, names, row_label, value, log):
-    # 1) zkus známé name/id
-    for css in names:
-        loc = page.locator(css)
-        if loc.count():
-            loc.first.fill(str(value))
-            log(f"Vedoucí '{row_label}' vyplněn přes {css}: {value}")
-            return True
-
-    # 2) fallback: najdi řádek s textem „Domácí:“/„Hosté:“ a vezmi první text input
-    lab = page.locator(f"text={row_label}").first
-    if lab.count():
-        cont = lab.locator("xpath=ancestor::*[self::tr or self::div][1]")
-        inp = cont.locator("input[type='text']").first
-        if inp.count():
-            inp.fill(str(value))
-            log(f"Vedoucí '{row_label}' vyplněn fallbackem: {value}")
-            return True
-    return False
-
-def set_team_leaders(page, home_leader, away_leader, log, set_home_only=True, set_away_only=True):
-    """Vyplní vedoucí družstev. Pokusí se i zaškrtnout 'Jen z oddílu', pokud je checkbox poblíž."""
-    if home_leader:
-        _fill_input_by_names_or_label_row(
-            page,
-            ["input[name='zapis_domaci_vedouci']",
-             "input[name='vedouci_domaci']",
-             "#zapis_domaci_vedouci"],
-            "Domácí:", home_leader, log
-        )
-        if set_home_only:
-            # checkbox ve stejném řádku
-            try:
-                lab = page.locator("text=Domácí:").first
-                cont = lab.locator("xpath=ancestor::*[self::tr or self::div][1]")
-                chk = cont.locator("input[type='checkbox']").first
-                if chk.count() and not chk.is_checked():
-                    chk.check()
-            except Exception:
-                pass
-
-    if away_leader:
-        _fill_input_by_names_or_label_row(
-            page,
-            ["input[name='zapis_hoste_vedouci']",
-             "input[name='vedouci_hoste']",
-             "#zapis_hoste_vedouci"],
-            "Hosté:", away_leader, log
-        )
-        if set_away_only:
-            try:
-                lab = page.locator("text=Hosté:").first
-                cont = lab.locator("xpath=ancestor::*[self::tr or self::div][1]")
-                chk = cont.locator("input[type='checkbox']").first
-                if chk.count() and not chk.is_checked():
-                    chk.check()
-            except Exception:
-                pass
-
 def wait_online_ready(page, log, timeout=25000):
-    # počkej na řádek zápasu a aspoň jeden vstup na sety
-    page.wait_for_selector("#zapis .event", state="visible", timeout=timeout)
-    page.wait_for_selector("#zapis .event .event-sety input.zapas-set", state="visible", timeout=timeout)
-    log("Online editor ready.")
-
-def _choose_player_loc(page, loc, name, log, timeout_each=2000):
     """
-    Klikne do buňky hráče a vyplní jméno přes autocomplete.
-    Zkouší několik vzorů a nakonec i :focus fallback. Ignoruje disabled/skryté inputy.
+    Počká na načtení online editoru.
+    """
+    try:
+        # Počkej na základní strukturu
+        page.wait_for_selector("#zapis .event", state="visible", timeout=timeout)
+        page.wait_for_selector(".zapas-set", state="visible", timeout=timeout)
+        log("Online editor ready.")
+    except Exception as e:
+        log(f"Online editor se nenačetl: {repr(e)}")
+        raise
+
+def _fill_player_by_click(page, selector, name, log):
+    """
+    Klikne na .player-name element a vyplní jméno přes autocomplete.
     """
     name = (name or "").strip()
     if not name:
         return
-
-    # 1) klik do cílové buňky (span/div se jménem)
-    loc.click()
-    page.wait_for_timeout(80)
-
-    # 2) kandidáti na autocomplete input
-    candidates = [
-        "input.ui-autocomplete-input",
-        "input.ac_input",
-        # obecný viditelný text input, ale NE sety ani skóre, NE disabled
-        "input[type='text']:not(.zapas-set):not(.utkani-skore):not([name='body']):not([disabled])"
-    ]
-
-    for css in candidates:
-        try:
-            inp = page.locator(css).first
-            inp.wait_for(state="visible", timeout=timeout_each)
-            # bezpečně smaž a napiš
-            inp.click()
-            page.keyboard.press("Control+A")
-            page.keyboard.press("Backspace")
-            inp.fill(name)
-            page.keyboard.press("Enter")
-            page.wait_for_timeout(120)
-            log(f"  player ← {name} (via {css})")
+        
+    try:
+        # 1) Klik na cílový element
+        player_elem = page.locator(selector)
+        if not player_elem.count():
+            log(f"  Nenalezen element: {selector}")
             return
-        except PwTimeout:
-            # nenašli jsme viditelný input tohoto typu – zkus další
-            pass
-        except Exception as e:
-            log(f"  candidate {css} failed: {repr(e)}")
-
-    # 3) fallback: aktuálně fokusovaný element (většinou autocomplete input)
-    try:
-        foc = page.locator(":focus")
-        if foc.count() > 0:
-            tag  = foc.evaluate("el => el.tagName.toLowerCase()")
-            typ  = foc.evaluate("el => el.type || ''")
-            dis  = foc.evaluate("el => !!el.disabled")
-            if tag == "input" and typ in ("text", "search") and not dis:
-                foc.click()
-                page.keyboard.press("Control+A")
-                page.keyboard.press("Backspace")
-                foc.fill(name)
-                page.keyboard.press("Enter")
-                page.wait_for_timeout(120)
-                log(f"  player ← {name} (via :focus)")
-                return
+            
+        player_elem.click(timeout=3000)
+        page.wait_for_timeout(300)  # Krátká pauza pro aktivaci autocomplete
+        
+        # 2) Najdi aktivní autocomplete input
+        autocomplete_selectors = [
+            "input.ui-autocomplete-input:focus",
+            "input.ac_input:focus", 
+            "input[type='text']:focus:not(.zapas-set):not([disabled])"
+        ]
+        
+        input_found = False
+        for sel in autocomplete_selectors:
+            inp = page.locator(sel)
+            if inp.count():
+                inp.fill(name)
+                page.keyboard.press("Tab")  # Nebo Enter pro potvrzení
+                page.wait_for_timeout(200)
+                log(f"  ✓ {name} → {selector}")
+                input_found = True
+                break
+                
+        if not input_found:
+            # Fallback: zkus napsat do aktuálně fokusovaného elementu
+            page.keyboard.type(name)
+            page.keyboard.press("Tab")
+            log(f"  ~ {name} → {selector} (fallback)")
+            
     except Exception as e:
-        log(f"  :focus fallback failed: {repr(e)}")
+        log(f"  ✗ {name} → {selector} failed: {repr(e)}")
 
-    # 4) poslední nouze – napiš naslepo do aktivního prvku
-    try:
-        page.keyboard.type(name)
-        page.keyboard.press("Enter")
-        log(f"  player ← {name} (typed)")
+def _fill_sets_by_event_index(page, event_index, sets, log):
+    """
+    Vyplní sety pro daný event podle jeho pozice v seznamu.
+    """
+    if not sets:
         return
-    except Exception:
-        pass
-
-    # když nic nevyšlo, ať je to vidět v logu i výjimkou
-    raise RuntimeError(f"Autocomplete input pro hráče '{name}' se nenašel (všechny varianty selhaly).")
-
-def _fill_sets_for_event(event_loc, sets, log):
-    """Vyplní až 5 setů v daném řádku .event."""
-    inputs = event_loc.locator(".event-sety input.zapas-set")
-    for i in range(min(5, len(sets))):
-        v = sets[i]
-        if v in (None, ""):
-            continue
-        try:
-            inputs.nth(i).fill(str(v))
-            log(f"  set{i+1} ← {v}")
-        except Exception as e:
-            log(f"  set{i+1} fill failed: {repr(e)}")
+        
+    try:
+        # Najdi event podle indexu
+        event = page.locator(".event").nth(event_index)
+        if not event.count():
+            log(f"  Event #{event_index} nenalezen")
+            return
+            
+        # Vyplň až 5 setů
+        for i, value in enumerate(sets[:5]):
+            if not value:
+                continue
+                
+            set_input = event.locator(f".zapas-set[data-set='{i+1}']")
+            if set_input.count():
+                set_input.fill(str(_map_wo(value)))
+                log(f"  set{i+1} ← {value} (event #{event_index})")
+            else:
+                log(f"  Set {i+1} input nenalezen pro event #{event_index}")
+                
+    except Exception as e:
+        log(f"  Sety pro event #{event_index} selhaly: {repr(e)}")
 
 def _map_wo(val):
-    """WO 3:0 → 101, WO 0:3 → -101, jinak původní hodnota."""
+    """Mapuje WO značky na STIS kódy."""
     if not val:
         return ""
     s = str(val).strip().upper().replace(" ", "")
     if s in ("WO3:0", "3:0WO"):
         return "101"
-    if s in ("WO0:3", "0:3WO"):
+    if s in ("WO0:3", "0:3WO"):  
         return "-101"
     return val
 
@@ -302,12 +132,12 @@ def _dom_dump(page, xlsx_path, log):
     except Exception as e:
         log(f"DOM dump failed: {repr(e)}")
 
-
 def cnt(page, css):  # krátká pomůcka do logu
     try:
         return page.locator(css).count()
     except Exception:
         return -1
+
 def map_wo(s):
     """mapování WO značek na STIS kódy, jinak vrací čistý text/číslo"""
     t = str(s or "").strip()
@@ -318,50 +148,6 @@ def map_wo(s):
     if t.upper() in ("WO 0:3", "WO 0:3", "WO0:3"):
         return "-101"
     return t
-def _input_or_select(page, base, idx):
-    """
-    Vrátí locator na input/select pro dané pole. Bere:
-      - exact: input[name='base_idx'] / select[name='base_idx']
-      - tolerantní: input[name^='base'][name$='_{idx}'] / select[...]
-    """
-    exact = f"[name='{base}_{idx}']"
-    loose = f"[name^='{base}'][name$='_{idx}']"
-    sel = f"input{exact}, select{exact}, input{loose}, select{loose}"
-    loc = page.locator(sel)
-    if loc.count():
-        return loc.first
-    return None
-
-def _fill_name(page, base, idx, value, log):
-    if not value:
-        return
-    loc = _input_or_select(page, base, idx)
-    if not loc:
-        log(f"✗ nenalezeno pole {base}_{idx}")
-        return
-    try:
-        tag = loc.evaluate("e => e.tagName.toLowerCase()")
-        if tag == "select":
-            loc.select_option(label=str(value))
-        else:
-            loc.fill(str(value))
-        log(f"✓ {base}_{idx} ← {value}")
-    except Exception as e:
-        log(f"✗ {base}_{idx} fill failed:", repr(e))
-
-def _fill_set(page, set_no, idx, value, log):
-    if not value: 
-        return
-    base = f"set{set_no}"
-    loc = _input_or_select(page, base, idx)
-    if not loc:
-        log(f"✗ nenalezeno pole {base}_{idx}")
-        return
-    try:
-        loc.fill(str(value))
-        log(f"✓ {base}_{idx} ← {value}")
-    except Exception as e:
-        log(f"✗ {base}_{idx} fill failed:", repr(e))
 
 def read_zdroj_data(xlsx_path):
     """Načte čtyřhru a singly z listu 'zdroj' – podle výše uvedených konstant."""
@@ -395,23 +181,9 @@ def read_zdroj_data(xlsx_path):
 
     return {"double": double, "singles": singles}
 
-def boot(msg: str):
-    """Zapiš krátkou zprávu ještě před main() – přežije i selhání argparse."""
-    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n"
-    for p in BOOT_FILES:
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            with open(p, "a", encoding="utf-8") as f:
-                f.write(line)
-        except Exception:
-            pass
-
 def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     """
-    data: dict z read_zdroj_data()
-      - data['double']: {'home1','home2','away1','away2','sets':[...]}
-      - data['singles']: list({'idx':2..17,'home','away','sets':[...]}).
-    Vyplní online formulář STIS (DOM s #c0,#c1 a #d0..#d15).
+    Vyplní online formulář STIS podle skutečné struktury DOM.
     """
     try:
         wait_online_ready(page, log)
@@ -421,63 +193,74 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
             _dom_dump(page, xlsx_path, log)
         raise
 
-    events = page.locator("#zapis .event")
-
-    # ---- ČTYŘHRY (#c0, #c1) ----
+    # ---- ČTYŘHRA #1 (ID: c0) ----
     dbl = data.get("double", {})
-    # #c0
-    c0_dom = page.locator("#c0 .player.domaci .player-name")
-    c0_hst = page.locator("#c0 .player.host .player-name")
-    _choose_player_loc(page, c0_dom.nth(0), dbl.get("home1"), log)
-    _choose_player_loc(page, c0_dom.nth(1), dbl.get("home2"), log)
-    _choose_player_loc(page, c0_hst.nth(0), dbl.get("away1"), log)
-    _choose_player_loc(page, c0_hst.nth(1), dbl.get("away2"), log)
-    sets0 = [ _map_wo(x) for x in (dbl.get("sets") or []) ] + [""]*5
-    _fill_sets_for_event(events.nth(0), sets0, log)
-
-    # #c1 – pokud ve vstupu máš druhou čtyřhru, přidej ji do data['double2']
-    dbl2 = data.get("double2")
-    if dbl2:
-        c1_dom = page.locator("#c1 .player.domaci .player-name")
-        c1_hst = page.locator("#c1 .player.host .player-name")
-        _choose_player_loc(page, c1_dom.nth(0), dbl2.get("home1"), log)
-        _choose_player_loc(page, c1_dom.nth(1), dbl2.get("home2"), log)
-        _choose_player_loc(page, c1_hst.nth(0), dbl2.get("away1"), log)
-        _choose_player_loc(page, c1_hst.nth(1), dbl2.get("away2"), log)
-        sets1 = [ _map_wo(x) for x in (dbl2.get("sets") or []) ] + [""]*5
-        _fill_sets_for_event(events.nth(1), sets1, log)
-
-    # ---- DVOUHRY (#d0 .. #d15) ----
-    for m in (data.get("singles") or []):
-        idx = int(m.get("idx", 0))
-        if idx < 2 or idx > 17:
-            continue
-        d_id = f"#d{idx-2}"
-        ev   = events.nth(idx)
-        _choose_player_loc(page, page.locator(f"{d_id} .player.domaci .player-name"), m.get("home"), log)
-        _choose_player_loc(page, page.locator(f"{d_id} .player.host .player-name"),   m.get("away"), log)
-        setsS = [ _map_wo(x) for x in (m.get("sets") or []) ] + [""]*5
-        _fill_sets_for_event(ev, setsS, log)
-
-    log("Klikám 'Uložit změny'…")
-    page.locator("input[name='ulozit']").last.click()
-    page.wait_for_timeout(600)
     
+    # Domácí hráči čtyřhry
+    if dbl.get("home1"):
+        _fill_player_by_click(page, "#c0 .cell-player:first-child .player.domaci .player-name", dbl["home1"], log)
+    if dbl.get("home2"):
+        _fill_player_by_click(page, "#c0 .cell-player:last-child .player.domaci .player-name", dbl["home2"], log)
+    
+    # Hostující hráči čtyřhry  
+    if dbl.get("away1"):
+        _fill_player_by_click(page, "#c0 .cell-player:first-child .player.host .player-name", dbl["away1"], log)
+    if dbl.get("away2"):
+        _fill_player_by_click(page, "#c0 .cell-player:last-child .player.host .player-name", dbl["away2"], log)
+    
+    # Sety pro čtyřhru #1 (první .event)
+    if dbl.get("sets"):
+        _fill_sets_by_event_index(page, 0, dbl["sets"], log)
+
+    # ---- SINGLY (d0 až d15) ----
+    # Vaše data mají indexy 2-17, ale DOM má d0-d15, takže index-2 = DOM_ID
+    for match_data in data.get("singles", []):
+        excel_idx = int(match_data.get("idx", 0))  # 2, 3, 4, ... 17
+        if excel_idx < 2 or excel_idx > 17:
+            continue
+            
+        dom_idx = excel_idx - 2  # 0, 1, 2, ... 15
+        event_idx = excel_idx    # pozice v seznamu eventů (čtyřhry zabírají 0,1, singly začínají od 2)
+        
+        # Domácí hráč
+        if match_data.get("home"):
+            _fill_player_by_click(page, f"#d{dom_idx} .player.domaci .player-name", match_data["home"], log)
+        
+        # Hostující hráč    
+        if match_data.get("away"):
+            _fill_player_by_click(page, f"#d{dom_idx} .player.host .player-name", match_data["away"], log)
+        
+        # Sety
+        if match_data.get("sets"):
+            _fill_sets_by_event_index(page, event_idx, match_data["sets"], log)
+
+    # Uložit změny
+    log("Klikám 'Uložit změny'…")
+    try:
+        page.locator("input[name='ulozit']").click(timeout=5000)
+        page.wait_for_timeout(1000)
+        log("Změny uloženy.")
+    except Exception as e:
+        log(f"Uložení selhalo: {repr(e)}")
+
+def boot(msg: str):
+    """Zapíš krátkou zprávu ještě před main() – přežije i selhání argparse."""
+    line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n"
+    for p in BOOT_FILES:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            with open(p, "a", encoding="utf-8") as f:
+                f.write(line)
+        except Exception:
+            pass
+
 def msgbox(text: str, title: str="stis-uploader"):
     try:
         ctypes.windll.user32.MessageBoxW(0, str(text), str(title), 0x40)  # MB_ICONINFORMATION
     except Exception:
         pass
 
-
 BOOTLOG = Path(os.environ.get("TEMP", str(Path.cwd()))) / "stis_boot.log"
-
-def boot(msg: str):
-    try:
-        with open(BOOTLOG, "a", encoding="utf-8") as f:
-            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n")
-    except Exception:
-        pass
 
 def make_logger(xlsx_path: Path):
     """Vrátí (log_fn, file_handle, log_path) – loguje s časovou značkou."""
@@ -515,26 +298,6 @@ def ensure_pw_browsers(log=None):
     finally:
         sys.argv = old_argv
 
-
-def _safe_fill(page, sel, value, log):
-    if not value:
-        return
-    loc = page.locator(sel)
-    if loc.count():
-        try:
-            loc.first.fill(str(value))
-            log("fill", sel, "→", value)
-        except Exception as e:
-            log("fill FAILED", sel, repr(e))
-
-def _fill_sets(page, base_idx, sets, log):
-    for i, val in enumerate(sets, start=1):
-        if not val: 
-            continue
-        sel = f"input[name='set{i}_{base_idx}']"
-        _safe_fill(page, sel, val, log)
-
-
 def norm(x) -> str:
     s = "" if x is None else str(x)
     s = s.strip().lower()
@@ -545,8 +308,6 @@ def norm(x) -> str:
     s = re.sub(r"\s+", "", s)
     s = re.sub(r"[^0-9a-z_]", "", s)
     return s
-
-
 
 def as_time_txt(v):
     if v is None: return None
@@ -584,7 +345,6 @@ def find_login_pwd(ws):
             if v == "heslo" and c + 1 <= (ws.max_column or 0):
                 found_pwd = str(ws.cell(r, c + 1).value or "").strip()
     return found_login, found_pwd
-
 
 def find_teams_header_anywhere(wb):
     """
@@ -669,7 +429,7 @@ def read_excel_config(xlsx_path: Path, team_name: str):
     """
     wb = load_workbook(xlsx_path, data_only=True)
 
-    # 1) Najdi list a řádek hlavičky Teams kdekoliv v sešitu
+    # 1) Najdi list a řádek hlavičky Teams kdekoli v sešitu
     setup, hdr_row = find_teams_header_anywhere(wb)
     if setup is None:
         # diagnostika – co jsme nahoře viděli
@@ -762,26 +522,6 @@ def read_excel_config(xlsx_path: Path, team_name: str):
 
     return login, pwd, team
 
-
-def click_save_and_continue(page):
-    sels = [
-        "input[type=submit][value*='pokrač']",
-        "input[type=submit][value*='pokrac']",
-        "button:has-text('pokrač')",
-        "button:has-text('pokrac')",
-        "input[name='odeslat'][value*='pokrač']",
-    ]
-    for sel in sels:
-        if page.locator(sel).count():
-            page.locator(sel).first.click()
-            return True
-    subs = page.locator("form input[type=submit]")
-    if subs.count() >= 2:
-        subs.nth(1).click()
-        return True
-    return False
-
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--xlsx", required=True, help="plná cesta k XLSX")
@@ -792,14 +532,13 @@ def parse_args():
     p.set_defaults(headed=True)  # výchozí = viditelné okno
     return p.parse_args()
 
-
-
 def main():
     args = parse_args()
     xlsx_path = Path(args.xlsx).resolve()
     if not xlsx_path.exists():
         raise RuntimeError(f"Soubor neexistuje: {xlsx_path}")
 
+    # logger vedle XLSX
     log, log_file, log_path = make_logger(xlsx_path)
     log("==== stis_uploader start ====")
     log("XLSX:", xlsx_path)
@@ -807,92 +546,155 @@ def main():
     log("Headed:", getattr(args, "headed", True))
 
     try:
-        login, pwd, team = read_excel_config(xlsx_path, args.team)
+        # 1) načti přihlášení + tým
+        user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
         log("Login OK; team:", team["name"], "ID:", team["id"])
 
         headed = bool(getattr(args, "headed", True))
+        headless = not headed
 
         with sync_playwright() as p:
             ensure_pw_browsers(log)
-            # --- spuštění prohlížeče
-            log("Launching browser… headless =", not headed)
+
+            # 2) spuštění prohlížeče (Chromium → Chrome → Edge)
+            log("Launching browser… headless =", headless)
+            browser = None
             try:
-                browser = p.chromium.launch(headless=not headed)
+                browser = p.chromium.launch(headless=headless)
                 log("Launched: managed Chromium")
             except Exception as e1:
                 log("Chromium failed:", repr(e1), "→ trying channel=chrome")
                 try:
-                    browser = p.chromium.launch(channel="chrome", headless=not headed)
+                    browser = p.chromium.launch(channel="chrome", headless=headless)
                     log("Launched: channel=chrome")
                 except Exception as e2:
                     log("Chrome failed:", repr(e2), "→ trying channel=msedge")
-                    browser = p.chromium.launch(channel="msedge", headless=not headed)
+                    browser = p.chromium.launch(channel="msedge", headless=headless)
                     log("Launched: channel=msedge")
 
-            ctx = browser.new_context()
-            page = ctx.new_page()
+            context = browser.new_context()
+            page = context.new_page()
 
-            # --- login
+            # 3) login
             log("Navigating to login…")
-            page.goto("https://registr.ping-pong.cz/htm/auth/login.php", wait_until="domcontentloaded")
-            page.fill("input[name='login']", login)
-            page.fill("input[name='heslo']",  pwd)
+            page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
+                      wait_until="domcontentloaded")
+            page.fill("input[name='login']", user_login)
+            page.fill("input[name='heslo']",  user_pwd)
             page.locator("[name='send']").click()
             page.wait_for_load_state("domcontentloaded")
             log("Logged in.")
 
-            # --- stránka družstva
+            # 4) stránka družstva
             team_url = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
             log("Open team page:", team_url)
             page.goto(team_url, wait_until="domcontentloaded")
 
-            # --- vstup do formuláře (vložit/upravit zápis)
+            # 5) najdi vstup do formuláře (vložit/upravit)
             log("Hledám odkaz 'vložit/upravit zápis'…")
             if not open_match_form(page, log):
                 raise RuntimeError("Na stránce družstva jsem nenašel odkaz do formuláře.")
 
-            # --- pokud jsme na online_start.php → vyplň Herna/Začátek/Vedoucí a pokračuj
-            if "online_start.php" in page.url:
-                fill_start_form(
-                    page,
-                    herna   = str(team.get("herna")   or ""),
-                    zacatek = str(team.get("zacatek") or ""),
-                    ved_dom = str(team.get("ved_dom") or ""),
-                    ved_host= str(team.get("ved_host")or ""),
-                    log     = log
-                )
-            else:
-                # (už rozpracovaný zápis skočil rovnou do online.php)
-                log("Přeskočeno online_start – jsem rovnou na:", page.url)
+            # 6) vyplň úvodní údaje (herna / začátek / vedoucí)
+            if team.get("herna") and page.locator("input[name='zapis_herna']").count():
+                page.fill("input[name='zapis_herna']", str(team["herna"]))
+                log("Herna vyplněna:", team["herna"])
 
-            # --- teď už MUSÍME být na online.php
+            # OPRAVENÉ vyplnění času pomocí dvou select elementů
+            if team.get("zacatek"):
+                try:
+                    hh, mm = team["zacatek"].split(":")
+                    # Použij správné name atributy z HTML dumpu
+                    if page.locator("select[name='zapis_zacatek_hodiny']").count():
+                        page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
+                        log(f"Hodina nastavena: {hh}")
+                    if page.locator("select[name='zapis_zacatek_minuty']").count():
+                        page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
+                        log(f"Minuta nastavena: {mm}")
+                    log("Začátek nastaven:", team["zacatek"])
+                except Exception as e:
+                    log("Set start time failed:", repr(e))
+
+            # OPRAVENÉ vyplnění vedoucích pomocí autocomplete inputů
+            if team.get("ved_dom"):
+                try:
+                    ved_input = page.locator("input[name='id_domaci_vedoucitext']")
+                    if ved_input.count():
+                        ved_input.fill(str(team["ved_dom"]))
+                        page.keyboard.press("Tab")  # Aktivace autocomplete
+                        page.wait_for_timeout(500)
+                        log("Vedoucí domácích:", team["ved_dom"])
+                except Exception as e:
+                    log("Vedoucí domácích selhal:", repr(e))
+
+            if team.get("ved_host"):
+                try:
+                    ved_input = page.locator("input[name='id_hoste_vedoucitext']")
+                    if ved_input.count():
+                        ved_input.fill(str(team["ved_host"]))
+                        page.keyboard.press("Tab")  # Aktivace autocomplete
+                        page.wait_for_timeout(500)
+                        log("Vedoucí hostů:", team["ved_host"])
+                except Exception as e:
+                    log("Vedoucí hostů selhal:", repr(e))
+
+            # 7) Uložit a pokračovat (robustně)
+            log("Click 'Uložit a pokračovat'…")
+            clicked = False
+            
+            # Zkus najít tlačítko "Uložit a pokračovat" podle name atributu z HTML dumpu
+            try:
+                btn = page.locator("input[name='odeslat']")  # "Uložit a pokračovat" má name="odeslat"
+                if btn.count():
+                    btn.click(timeout=5000)
+                    clicked = True
+                    log("Kliknuto na 'Uložit a pokračovat' (name=odeslat)")
+            except Exception as e:
+                log("Button(name=odeslat) click failed:", repr(e))
+            
+            # Fallback podle value atributu
+            if not clicked:
+                try:
+                    btn = page.locator("input[value*='pokračovat']")
+                    if btn.count():
+                        btn.first.click(timeout=5000)
+                        clicked = True
+                        log("Kliknuto na 'Uložit a pokračovat' (value)")
+                except Exception as e:
+                    log("Button(value) click failed:", repr(e))
+
+            if not clicked:
+                raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
+
+            # 8) Čekej na online formulář
+            try:
+                page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
+            except Exception:
+                # fallback: aspoň počkat na nějaké textové inputy
+                page.wait_for_selector("input[type='text']", timeout=10000)
             log("Online formulář načten:", page.url)
-
-            # --- načti data z listu 'zdroj' a vyplň
+            
+            # 9) vyplň data
             data = read_zdroj_data(xlsx_path)
             fill_online_from_zdroj(page, data, log, xlsx_path)
-
-            # volitelně uložit
-            try:
-                page.get_by_role("button", name=re.compile(r"uložit\s*změny", re.I)).first.click(timeout=4000)
-                log("Kliknuto na 'Uložit změny'.")
-            except Exception as e:
-                log("'Uložit změny' nenašlo/nekliklo:", repr(e))
-
-            # nech prohlížeč otevřený pro vizuální kontrolu
+            
+            # 10) vizuální dokončení
             if headed:
                 log("Leaving browser open for manual finish.")
+                print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
                 while True:
                     time.sleep(1)
             else:
-                ctx.close()
+                context.close()
                 browser.close()
 
     except Exception as e:
         log("ERROR:", repr(e))
         log(traceback.format_exc())
-        try: os.startfile(str(log_path))
-        except Exception: pass
+        try:
+            os.startfile(str(log_path))  # otevřít log v Notepadu
+        except Exception:
+            pass
         raise
     finally:
         try:
@@ -905,7 +707,7 @@ if __name__ == "__main__":
     boot("=== EXE start ===")
     try:
         boot("argv: " + " ".join(sys.argv))
-        main()  # tvoje stávající main() – neměň
+        main()
         boot("main() finished OK")
     except SystemExit as e:
         boot(f"SystemExit (pravděpodobně argparse): code={getattr(e, 'code', None)}")
