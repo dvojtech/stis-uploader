@@ -760,15 +760,33 @@ def main():
             log("Online formulář načten:", page.url)
 
             
-            # 10) vizuální dokončení
+            # 10) vizuální dokončení – čekej do zavření okna, pak se korektně ukonči
             if headed:
-                log("Leaving browser open for manual finish.")
-                print("✅ Online formulář načten – dokonči ručně. Okno nechávám otevřené.")
-                while True:
-                    time.sleep(1)
+                log("Čekám, až zavřeš okno prohlížeče…")
+                try:
+                    # blokující čekání na zavření stránky uživatelem
+                    page.wait_for_event("close")
+                except Exception as e:
+                    log("wait close error:", repr(e))
+                finally:
+                    try:
+                        context.close()
+                    except Exception:
+                        pass
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
             else:
-                context.close()
-                browser.close()
+                try:
+                    context.close()
+                except Exception:
+                    pass
+                try:
+                    browser.close()
+                except Exception:
+                    pass
+
 
     except Exception as e:
         log("ERROR:", repr(e))
