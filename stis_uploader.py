@@ -165,38 +165,72 @@ def map_wo(s):
     if t.upper() in ("WO 0:3", "WO 0:3", "WO0:3"):
         return "-101"
     return t
-
 def read_zdroj_data(xlsx_path):
     """Načte čtyřhru a singly z listu 'zdroj' – podle výše uvedených konstant."""
     from openpyxl import load_workbook
+    
     wb = load_workbook(xlsx_path, data_only=True)
     if ZDROJ_SHEET not in wb.sheetnames:
-        raise RuntimeError(f"V sešitu chybí list '{ZDROJ_SHEET}'")
+        # Debug: vypsat dostupné listy
+        available = ", ".join(wb.sheetnames)
+        raise RuntimeError(f"V sešitu chybí list '{ZDROJ_SHEET}'. Dostupné: {available}")
+    
     sh = wb[ZDROJ_SHEET]
 
     def cell(r, c):
-        return str(sh.cell(r, c).value or "").strip()
+        val = sh.cell(r, c).value
+        return str(val or "").strip()
+
+    def debug_cell(r, c, desc=""):
+        val = sh.cell(r, c).value
+        print(f"DEBUG {desc}: R{r}C{c} = {repr(val)} -> '{str(val or '').strip()}'")
+        return str(val or "").strip()
+
+    print(f"DEBUG: Načítám data z listu '{ZDROJ_SHEET}'")
+    print(f"DEBUG: Max row: {sh.max_row}, Max col: {sh.max_column}")
 
     # ČTYŘHRA – jména (D2,D3,E2,E3) a sety (I3..M3)
     double = {
-        "home1": cell(2, 4),  # D2
-        "home2": cell(3, 4),  # D3
-        "away1": cell(2, 5),  # E2
-        "away2": cell(3, 5),  # E3
-        "sets":  [ map_wo(cell(3, 9+i)) for i in range(5) ]  # I3..M3
+        "home1": debug_cell(2, 4, "double home1 D2"),
+        "home2": debug_cell(3, 4, "double home2 D3"), 
+        "away1": debug_cell(2, 5, "double away1 E2"),
+        "away2": debug_cell(3, 5, "double away2 E3"),
+        "sets":  []
     }
+    
+    # Sety čtyřhry (I3..M3)
+    for i in range(5):
+        col = 9 + i  # I=9, J=10, K=11, L=12, M=13
+        val = debug_cell(3, col, f"double set{i+1}")
+        double["sets"].append(map_wo(val))
+
+    print(f"DEBUG: Čtyřhra načtena: {double}")
 
     # SINGLY – indexy 2..(2+SINGLES_COUNT-1) → řádky od ZDROJ_FIRST_SINGLE_ROW
     singles = []
     row = ZDROJ_FIRST_SINGLE_ROW
+    
     for idx in range(2, 2 + SINGLES_COUNT):
-        home = cell(row, 4)  # D
-        away = cell(row, 5)  # E
-        sets = [ map_wo(cell(row, 9+i)) for i in range(5) ]  # I..M
-        singles.append({"idx": idx, "home": home, "away": away, "sets": sets})
+        print(f"DEBUG: Načítám singl #{idx} z řádku {row}")
+        
+        home = debug_cell(row, 4, f"singl{idx} home")
+        away = debug_cell(row, 5, f"singl{idx} away") 
+        sets = []
+        
+        for i in range(5):
+            col = 9 + i
+            val = debug_cell(row, col, f"singl{idx} set{i+1}")
+            sets.append(map_wo(val))
+            
+        single = {"idx": idx, "home": home, "away": away, "sets": sets}
+        singles.append(single)
+        print(f"DEBUG: Singl {idx}: {single}")
         row += 1
 
-    return {"double": double, "singles": singles}
+    result = {"double": double, "singles": singles}
+    print(f"DEBUG: Celkem načteno - čtyřhra: {bool(double['home1'] or double['home2'])}, singly: {len([s for s in singles if s['home'] or s['away']])}")
+    
+    return result
 
 def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     """
@@ -611,11 +645,18 @@ def main():
         log("Login OK; team:", team["name"], "ID:", team["id"])
         log("Time (XLSX raw → parsed):", repr(team.get("zacatek_raw")), "→", team.get("zacatek"))
 
+        # 1.5) DŮLEŽITÉ: Načti data ze "zdroj" listu
+        try:
+            zdroj_data = read_zdroj_data(xlsx_path)
+            log("Zdroj data loaded - singles:", len(zdroj_data.get("singles", [])))
+        except Exception as e:
+            log("WARNING: Nepodařilo se načíst data ze 'zdroj' listu:", repr(e))
+            zdroj_data = None
 
         headed = bool(getattr(args, "headed", True))
         headless = not headed
 
-        # nasměruj Playwright na přibalené prohlížeče (pokud jsou)
+        # nasmě směruj Playwright na přibalené prohlížeče (pokud jsou)
         _used_bundled = _use_bundled_ms_playwright(log)
 
         with sync_playwright() as p:
@@ -665,27 +706,47 @@ def main():
                 page.fill("input[name='zapis_herna']", str(team["herna"]))
                 log("Herna vyplněna:", team["herna"])
 
-          
-            # Začátek utkání: 2× <select> (hodiny/minuty) – vždy nastav, i když v sešitu chybí
+            # OPRAVA: Robustnější nastavení času
             start_txt = (team.get("zacatek") or "19:00").strip()
             try:
-                hh, mm = start_txt.split(":")
+                if ":" in start_txt:
+                    hh, mm = start_txt.split(":")[:2]
+                else:
+                    hh, mm = "19", "00"  # fallback
+                
+                hh = int(hh)
+                mm = int(mm)
+                
+                # Vždy nastav čas, i když je chybný v excelu
                 if page.locator("select[name='zapis_zacatek_hodiny']").count():
-                    page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
-                    log(f"Hodina nastavena: {int(hh):02d}")
+                    page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
+                    log(f"Hodina nastavena: {hh:02d}")
+                    
                 if page.locator("select[name='zapis_zacatek_minuty']").count():
-                    page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
-                    log(f"Minuta nastavena: {int(mm):02d}")
-                page.click("body")  # vyvolá 'change'
-                log("Začátek nastaven:", f"{int(hh):02d}:{int(mm):02d}")
+                    page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
+                    log(f"Minuta nastavena: {mm:02d}")
+                    
+                # Důležité: Spusť change event
+                page.evaluate("document.querySelector('select[name=\"zapis_zacatek_hodiny\"]').dispatchEvent(new Event('change'))")
+                page.evaluate("document.querySelector('select[name=\"zapis_zacatek_minuty\"]').dispatchEvent(new Event('change'))")
+                page.wait_for_timeout(500)
+                
+                log("Začátek nastaven:", f"{hh:02d}:{mm:02d}")
+                
             except Exception as e:
                 log("Set start time failed:", repr(e))
+                # Nouzové nastavení
+                try:
+                    page.select_option("select[name='zapis_zacatek_hodiny']", value="19")
+                    page.select_option("select[name='zapis_zacatek_minuty']", value="0")
+                    log("Fallback čas: 19:00")
+                except Exception:
+                    pass
             
-            # Vedoucí – vyplň jen když je pole povolené a prázdné
+            # Vedoucí - vyplň jen když je pole povolené a prázdné
             try:
                 vi = page.locator("input[name='id_domaci_vedoucitext']")
                 if vi.count():
-                    # když je disabled nebo už má hodnotu, jen zaloguj a nepřepisuj
                     val = (vi.get_attribute("value") or "").strip()
                     if vi.is_disabled() or val:
                         log("Vedoucí domácích (locked/filled):", val or "(prázdné)")
@@ -711,72 +772,65 @@ def main():
             except Exception as e:
                 log("Vedoucí hostů selhal:", repr(e))
                 
-            
-            # 7) Uložit a pokračovat (robustně)
-            log("Click 'Uložit a pokračovat'…")
-            clicked = False
-            
-            # Zkus najít tlačítko "Uložit a pokračovat" podle name atributu z HTML dumpu
-            try:
-                btn = page.locator("input[name='odeslat']")  # "Uložit a pokračovat" má name="odeslat"
-                if btn.count():
-                    btn.click(timeout=5000)
-                    clicked = True
-                    log("Kliknuto na 'Uložit a pokračovat' (name=odeslat)")
-            except Exception as e:
-                log("Button(name=odeslat) click failed:", repr(e))
-            
-            # Fallback podle value atributu
-            if not clicked:
+            # 7) OPRAVA: Vícekrát zkus odeslat formulář dokud nezmizí chyba
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                log(f"Pokus {attempt+1}/{max_attempts}: Click 'Uložit a pokračovat'…")
+                
                 try:
-                    btn = page.locator("input[value*='pokračovat']")
+                    # Najdi a klikni na tlačítko
+                    btn = page.locator("input[name='odeslat']")
                     if btn.count():
-                        btn.first.click(timeout=5000)
-                        clicked = True
-                        log("Kliknuto na 'Uložit a pokračovat' (value)")
+                        btn.click(timeout=5000)
+                        page.wait_for_load_state("domcontentloaded")
+                        log("Formulář odeslán")
+                        
+                        # Zkontroluj, jestli je stále chyba
+                        if page.locator(".exception:has-text('není vyplněn začátek utkání')").count():
+                            log(f"Pokus {attempt+1}: Server stále hlásí chybu s časem")
+                            if attempt < max_attempts - 1:
+                                # Zkus čas nastavit znovu
+                                page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
+                                page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
+                                page.wait_for_timeout(500)
+                                continue
+                        else:
+                            log("Formulář úspěšně odeslán bez chyby")
+                            break
+                            
                 except Exception as e:
-                    log("Button(value) click failed:", repr(e))
+                    log(f"Pokus {attempt+1} selhal:", repr(e))
+                    if attempt == max_attempts - 1:
+                        raise RuntimeError("Nepodařilo se odeslat formulář ani po několika pokusech")
 
-            if not clicked:
-                raise RuntimeError("Nenašel jsem tlačítko/odkaz 'Uložit a pokračovat'.")
-
-            # 8) Po submitu – nejprve kontrola serverové chyby s časem
-            # Po submitu – kontrola chyby s časem
-            page.wait_for_load_state("domcontentloaded")
-            if page.locator(".exception:has-text('není vyplněn začátek utkání')").count():
-                log("Server hlásí: není vyplněn začátek utkání → přenastavím a zkusím znovu…")
-                try:
-                    page.select_option("select[name='zapis_zacatek_hodiny']", value=str(int(hh)))
-                    page.select_option("select[name='zapis_zacatek_minuty']", value=str(int(mm)))
-                    page.click("body")
-                    page.locator("input[name='odeslat']").click(timeout=5000)
-                except Exception as e:
-                    log("Re-submit selhal:", repr(e))
-            
-            # 9) Čekej na online editor (URL /online.php?u=…)
-            # Čekání na online editor
+            # 8) Čekej na online editor
             try:
-                page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
-                log("Online formulář načten:", page.url)
-                wait_online_ready(page, log)   # ← přidej tento řádek
-                log("Editor potvrzen jako 'ready' – URL:", page.url)
-
-
-            except Exception:
-                if ("online_start.php" in page.url) and page.locator(".exception").count():
-                    log("Zůstal jsem na online_start.php s chybou.")
-                    raise RuntimeError("Server hlásí chybu na úvodním formuláři (pravděpodobně čas).")
-                page.wait_for_selector("input[type='text']", timeout=10000)
+                # Čekej buď na online.php nebo na přítomnost editovacích prvků
+                page.wait_for_function(
+                    "window.location.href.includes('online.php') || document.querySelector('input.zapas-set') !== null",
+                    timeout=30000
+                )
+                log("Online editor dostupný na:", page.url)
+                
+                # 9) KONEČNĚ: Vyplň data ze zdroj listu
+                if zdroj_data:
+                    log("Začínám vyplňovat sestavy a sety...")
+                    fill_online_from_zdroj(page, zdroj_data, log, xlsx_path)
+                    log("Sestavy a sety vyplněny")
+                else:
+                    log("VAROVÁNÍ: Žádná data ze 'zdroj' listu k vyplnění")
+                    
+            except Exception as e:
+                log("Problém s online editorem:", repr(e))
+                if xlsx_path:
+                    _dom_dump(page, xlsx_path, log)
+                raise
             
-            log("Online formulář načten:", page.url)
-
-            
-            # 10) vizuální dokončení – čekej do zavření okna, pak se korektně ukonči
-        
+            # 10) Vizuální dokončení
             if headed:
                 log("Čekám, až zavřeš okno prohlížeče…")
                 try:
-                    page.wait_for_event("close")   # ← okno zavřeš ručně křížkem
+                    page.wait_for_event("close")
                 except Exception as e:
                     log("wait close error:", repr(e))
                 finally:
@@ -790,13 +844,11 @@ def main():
                 try: browser.close()
                 except Exception: pass
 
-
-
     except Exception as e:
         log("ERROR:", repr(e))
         log(traceback.format_exc())
         try:
-            os.startfile(str(log_path))  # otevřít log v Notepadu
+            os.startfile(str(log_path))
         except Exception:
             pass
         raise
