@@ -41,18 +41,17 @@ def _use_bundled_ms_playwright(log):
         log("Bundled ms-playwright detection failed:", repr(e))
     return False
 
-def wait_online_ready(page, log, timeout=25000):
-    """
-    Počká na načtení online editoru.
-    """
-    try:
-        # Počkej na základní strukturu
-        page.wait_for_selector("#zapis .event", state="visible", timeout=timeout)
-        page.wait_for_selector(".zapas-set", state="visible", timeout=timeout)
-        log("Online editor ready.")
-    except Exception as e:
-        log(f"Online editor se nenačetl: {repr(e)}")
-        raise
+def wait_online_ready(page, log):
+    # STIS online editor: nahoře jsou tlačítka "Uložit změny" / "Dokončit zápis"
+    sel_ready = "button:has-text('Uložit změny'), input[type='button'][value*='Uložit změny'], input[type='submit'][value*='Uložit změny']"
+    page.wait_for_selector(sel_ready, timeout=30000)
+    # pro jistotu ověř, že jsme na online.php
+    if "online.php" not in page.url:
+        log("Pozn.: nejsem na online.php, aktuální URL:", page.url)
+    # informační log – kolik je editovatelných polí
+    cnt_inputs = page.locator("#zapis input[type='text'], #zapis input[type='number']").count()
+    log("Editor ready – editačních polí v #zapis:", cnt_inputs)
+
 
 def _fill_player_by_click(page, selector, name, log):
     """
@@ -202,6 +201,7 @@ def read_zdroj_data(xlsx_path):
 def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     """
     Vyplní online formulář STIS podle skutečné struktury DOM.
+    log("fill_online_from_zdroj: start – záznamů v XLSX:", len(data or []))
     """
     try:
         wait_online_ready(page, log)
@@ -751,6 +751,9 @@ def main():
             # Čekání na online editor
             try:
                 page.wait_for_url(re.compile(r"/online\.php\?u=\d+"), timeout=20000)
+                log("Online formulář načten:", page.url)
+                wait_online_ready(page, log)   # ← přidej tento řádek
+
             except Exception:
                 if ("online_start.php" in page.url) and page.locator(".exception").count():
                     log("Zůstal jsem na online_start.php s chybou.")
@@ -761,31 +764,24 @@ def main():
 
             
             # 10) vizuální dokončení – čekej do zavření okna, pak se korektně ukonči
+        
             if headed:
                 log("Čekám, až zavřeš okno prohlížeče…")
                 try:
-                    # blokující čekání na zavření stránky uživatelem
-                    page.wait_for_event("close")
+                    page.wait_for_event("close")   # ← okno zavřeš ručně křížkem
                 except Exception as e:
                     log("wait close error:", repr(e))
                 finally:
-                    try:
-                        context.close()
-                    except Exception:
-                        pass
-                    try:
-                        browser.close()
-                    except Exception:
-                        pass
+                    try: context.close()
+                    except Exception: pass
+                    try: browser.close()
+                    except Exception: pass
             else:
-                try:
-                    context.close()
-                except Exception:
-                    pass
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                try: context.close()
+                except Exception: pass
+                try: browser.close()
+                except Exception: pass
+
 
 
     except Exception as e:
