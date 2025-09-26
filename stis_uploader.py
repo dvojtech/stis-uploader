@@ -802,7 +802,8 @@ def main():
                     log(f"Pokus {attempt+1} selhal:", repr(e))
                     if attempt == max_attempts - 1:
                         raise RuntimeError("Nepodařilo se odeslat formulář ani po několika pokusech")
-
+                    
+            
             # 8) Čekej na online editor
             try:
                 # Čekej buď na online.php nebo na přítomnost editovacích prvků
@@ -811,9 +812,12 @@ def main():
                     timeout=30000
                 )
                 log("Online editor dostupný na:", page.url)
-                
-            # Nahraďte sekci na konci main() funkce (po vyplnění dat) tímto kódem:
-
+            except Exception as e:
+                log("Problém s online editorem:", repr(e))
+                if xlsx_path:
+                    _dom_dump(page, xlsx_path, log)
+                raise
+            
             # 9) KONEČNĚ: Vyplň data ze zdroj listu
             if zdroj_data:
                 log("Začínám vyplňovat sestavy a sety...")
@@ -821,6 +825,7 @@ def main():
                 log("Sestavy a sety vyplněny")
             else:
                 log("VAROVÁNÍ: Žádná data ze 'zdroj' listu k vyplnění")
+
                 
         except Exception as e:
             log("Problém s online editorem:", repr(e))
