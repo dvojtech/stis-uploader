@@ -1,8 +1,5 @@
 # stis_uploader.py
-import argparse, os, re, sys, time
-import unicodedata
-import traceback
-import ctypes
+import argparse, os, re, sys, time, unicodedata, traceback, ctypes
 from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
@@ -30,7 +27,121 @@ def _log(msg):
         print(msg, flush=True)
     except Exception:
         pass
-        
+
+def _parse_hh_mm(val):
+    """Vrátí ('HH','MM') z Excel hodnoty (datetime/time/'19:00'/'1900')."""
+    if isinstance(val, (time, datetime)):
+        return f"{val.hour:02d}", f"{val.minute:02d}"
+    s = str(val).strip()
+    m = re.match(r"^(\d{1,2})[:\.](\d{2})$", s) or re.match(r"^(\d{1,2})(\d{2})$", s)
+    if not m:
+        raise ValueError(f"Nečitelný čas: {val!r}")
+    return f"{int(m.group(1)):02d}", f"{int(m.group(2)):02d}"
+
+def set_start_time(page, start_val, log, timeout_each=1500):
+    """Vybere HH/MM z dropdownů i když mění jména/id (nejdřív známé selektory, pak heuristika)."""
+    hh, mm = _parse_hh_mm(start_val)
+
+    tried = [
+        ("select[name='zapis_zacatek_hod']", "select[name='zapis_zacatek_min']"),
+        ("#zapis_zacatek_hod", "#zapis_zacatek_min"),
+        ("select[name='zacatek_hod']", "select[name='zacatek_min']"),
+    ]
+    for hs, ms in tried:
+        h = page.locator(hs); m = page.locator(ms)
+        try:
+            if h.count() and m.count():
+                h.first.wait_for(state="visible", timeout=timeout_each)
+                m.first.wait_for(state="visible", timeout=timeout_each)
+                for tgt, val in ((h.first, hh), (m.first, mm)):
+                    try: tgt.select_option(label=val)
+                    except Exception: tgt.select_option(value=val)
+                log(f"Začátek nastaven přes {hs}/{ms} → {hh}:{mm}")
+                return
+        except PwTimeout:
+            pass
+
+    # heuristika: najdi dvě <select> s ~24 a ~60 možnostmi
+    cand_h, cand_m = [], []
+    for i in range(page.locator("select").count()):
+        s = page.locator("select").nth(i)
+        try:
+            n = s.evaluate("el => el.options ? el.options.length : 0")
+            if 22 <= n <= 26: cand_h.append(s)
+            elif 57 <= n <= 63: cand_m.append(s)
+        except Exception:
+            continue
+    if cand_h and cand_m:
+        h, m = cand_h[0], cand_m[0]
+        h.wait_for(state="visible", timeout=timeout_each)
+        m.wait_for(state="visible", timeout=timeout_each)
+        for tgt, val in ((h, hh), (m, mm)):
+            try: tgt.select_option(label=val)
+            except Exception: tgt.select_option(value=val)
+        log(f"Začátek nastaven heuristicky → {hh}:{mm}")
+        return
+
+    raise RuntimeError("Nepodařilo se nastavit 'Začátek utkání' – nenašel jsem časové <select>.")
+
+def _fill_input_by_names_or_label_row(page, names, row_label, value, log):
+    # 1) zkus známé name/id
+    for css in names:
+        loc = page.locator(css)
+        if loc.count():
+            loc.first.fill(str(value))
+            log(f"Vedoucí '{row_label}' vyplněn přes {css}: {value}")
+            return True
+
+    # 2) fallback: najdi řádek s textem „Domácí:“/„Hosté:“ a vezmi první text input
+    lab = page.locator(f"text={row_label}").first
+    if lab.count():
+        cont = lab.locator("xpath=ancestor::*[self::tr or self::div][1]")
+        inp = cont.locator("input[type='text']").first
+        if inp.count():
+            inp.fill(str(value))
+            log(f"Vedoucí '{row_label}' vyplněn fallbackem: {value}")
+            return True
+    return False
+
+def set_team_leaders(page, home_leader, away_leader, log, set_home_only=True, set_away_only=True):
+    """Vyplní vedoucí družstev. Pokusí se i zaškrtnout 'Jen z oddílu', pokud je checkbox poblíž."""
+    if home_leader:
+        _fill_input_by_names_or_label_row(
+            page,
+            ["input[name='zapis_domaci_vedouci']",
+             "input[name='vedouci_domaci']",
+             "#zapis_domaci_vedouci"],
+            "Domácí:", home_leader, log
+        )
+        if set_home_only:
+            # checkbox ve stejném řádku
+            try:
+                lab = page.locator("text=Domácí:").first
+                cont = lab.locator("xpath=ancestor::*[self::tr or self::div][1]")
+                chk = cont.locator("input[type='checkbox']").first
+                if chk.count() and not chk.is_checked():
+                    chk.check()
+            except Exception:
+                pass
+
+    if away_leader:
+        _fill_input_by_names_or_label_row(
+            page,
+            ["input[name='zapis_hoste_vedouci']",
+             "input[name='vedouci_hoste']",
+             "#zapis_hoste_vedouci"],
+            "Hosté:", away_leader, log
+        )
+        if set_away_only:
+            try:
+                lab = page.locator("text=Hosté:").first
+                cont = lab.locator("xpath=ancestor::*[self::tr or self::div][1]")
+                chk = cont.locator("input[type='checkbox']").first
+                if chk.count() and not chk.is_checked():
+                    chk.check()
+            except Exception:
+                pass
+
 def wait_online_ready(page, log, timeout=25000):
     # počkej na řádek zápasu a aspoň jeden vstup na sety
     page.wait_for_selector("#zapis .event", state="visible", timeout=timeout)
@@ -702,7 +813,15 @@ def main():
             if team.get("herna") and page.locator("input[name='zapis_herna']").count():
                 page.fill("input[name='zapis_herna']", str(team["herna"]))
                 log("Herna vyplněna:", team["herna"])
-
+            # čas začátku (sloupec v setupu např. 'začátek utkání' → u tebe mapováno na cfg_team['zacatek'])
+            set_start_time(page, cfg_team["zacatek"], log)
+            
+            # vedoucí (sloupce 'vedoucí domácích' a 'vedoucí hostů' → mapováno na 'vedouci_domacich' / 'vedouci_hostu')
+            set_team_leaders(page, cfg_team.get("vedouci_domacich"), cfg_team.get("vedouci_hostu"), log)
+            
+            # uložit a pokračovat
+            page.get_by_role("button", name="Uložit a pokračovat").click()
+            page.wait_for_load_state("domcontentloaded")
             if team.get("zacatek"):
                 if page.locator("input[name='zapis_zacatek']").count():
                     page.fill("input[name='zapis_zacatek']", team["zacatek"])
