@@ -28,15 +28,23 @@ def _log(msg):
     except Exception:
         pass
 
-def _parse_hh_mm(val):
-    """Vrátí ('HH','MM') z Excel hodnoty (datetime/time/'19:00'/'1900')."""
-    if isinstance(val, (time, datetime)):
-        return f"{val.hour:02d}", f"{val.minute:02d}"
-    s = str(val).strip()
-    m = re.match(r"^(\d{1,2})[:\.](\d{2})$", s) or re.match(r"^(\d{1,2})(\d{2})$", s)
+def _parse_hhmm(s: str) -> tuple[int, int]:
+    """Vrátí (hod, min) z '19:00', '19.00', '19 00', '19', …  Minuty zaokrouhlí na 5."""
+    if not s:
+        return (0, 0)
+    txt = str(s).strip()
+    m = re.findall(r"\d+", txt)
     if not m:
-        raise ValueError(f"Nečitelný čas: {val!r}")
-    return f"{int(m.group(1)):02d}", f"{int(m.group(2)):02d}"
+        return (0, 0)
+    if len(m) == 1:
+        hh, mm = int(m[0]), 0
+    else:
+        hh, mm = int(m[0]), int(m[1])
+    hh = max(0, min(23, hh))
+    mm = max(0, min(59, mm))
+    # STIS nabízí jen 00,05,10,…55 → zaokrouhlíme na nejbližších 5
+    mm = int(round(mm / 5) * 5) % 60
+    return (hh, mm)
 
 def set_start_time(page, start_val, log, timeout_each=1500):
     """Vybere HH/MM z dropdownů i když mění jména/id (nejdřív známé selektory, pak heuristika)."""
@@ -83,6 +91,46 @@ def set_start_time(page, start_val, log, timeout_each=1500):
 
     raise RuntimeError("Nepodařilo se nastavit 'Začátek utkání' – nenašel jsem časové <select>.")
 
+def fill_start_form(page, herna: str, zacatek: str, ved_dom: str, ved_host: str, log):
+    """Vyplní úvodní formulář (online_start.php) a přejde na online.php."""
+    # Herna (textové pole)
+    if herna:
+        page.locator("input[name='zapis_herna']").fill(herna)
+        log(f"Herna vyplněna: {herna}")
+
+    # Začátek utkání – dvě <select> s name='zapis_zacatek_hodiny' / '..._minuty'
+    hh, mm = _parse_hhmm(zacatek)
+    page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
+    page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
+    log(f"Začátek vyplněn: {hh:02d}:{mm:02d}")
+
+    # Vedoucí družstev – použijeme „fallback“: doplníme text do viditelných inputů
+    if ved_dom:
+        page.locator("input[name='id_domaci_vedoucitext']").fill(ved_dom)
+        log(f"Vedoucí 'Domácí:' → {ved_dom}")
+    if ved_host:
+        page.locator("input[name='id_hoste_vedoucitext']").fill(ved_host)
+        log(f"Vedoucí 'Hosté:' → {ved_host}")
+
+    # Uložit a pokračovat
+    page.locator("input[name='odeslat']").click()
+
+    # Po odeslání buď zůstaneme na online_start.php (chyba), nebo se přejde na online.php
+    # Nejprve krátce počkáme na případnou chybovou hlášku:
+    page.wait_for_load_state("networkidle")
+    url = page.url
+    if "online_start.php" in url:
+        # Zkusíme přečíst případnou chybu
+        err = page.locator(".exception").first
+        if err.is_visible():
+            log(f"Po odeslání zůstávám na startu – hláška: {err.inner_text()}")
+        else:
+            log("Po odeslání zůstávám na startu – bez hlášky.")
+        # Abychom nepokračovali do části pro online.php:
+        raise RuntimeError("Nepodařilo se přejít na online formulář (zkontroluj vyplnění času).")
+
+    # Jsme na online.php – ještě počkáme, až se objeví blok s utkáním
+    page.wait_for_selector("#zapis .event", timeout=25000)
 def _fill_input_by_names_or_label_row(page, names, row_label, value, log):
     # 1) zkus známé name/id
     for css in names:
