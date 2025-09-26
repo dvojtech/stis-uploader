@@ -3,6 +3,7 @@ import argparse, os, re, sys, time
 import unicodedata
 import traceback
 import ctypes
+import json
 from datetime import datetime
 from pathlib import Path
 from openpyxl import load_workbook
@@ -522,10 +523,97 @@ def read_excel_config(xlsx_path: Path, team_name: str):
 
     return login, pwd, team
 
+def inspect_xlsx(xlsx_path: Path, team_name: str, log):
+    """
+    Diagnostika vstupu: ukáže co přesně čteme z XLSX (RAW vs. parsované hodnoty).
+    Vytvoří také sidecar JSON soubor vedle XLSX.
+    """
+    from openpyxl import load_workbook
+
+    # co by uploader reálně použil
+    login, pwd, team = read_excel_config(xlsx_path, team_name)
+
+    # současně si vytáhneme „RAW“ buňky z listu s Teams
+    wb = load_workbook(xlsx_path, data_only=False)
+    setup, hdr_row = find_teams_header_anywhere(wb)  # už máš v souboru
+    idx = {}
+    max_c = min(80, setup.max_column or 0)
+    for c in range(1, max_c + 1):
+        h = norm(setup.cell(hdr_row, c).value or "")
+        if ("druzstvo" in h) and ("id" not in h) and ("vedouci" not in h):
+            idx["name"] = c
+        if (("druzstvoid" in h) or ("id_druzstva" in h) or ("iddruzstva" in h) or (h == "id")) and ("vedouci" not in h):
+            idx["id"] = c
+        if "vedoucidomacich" in h or ("vedouci" in h and "host" not in h):
+            idx["ved_dom"] = c
+        if "vedoucihostu" in h or ("vedouci" in h and "host" in h):
+            idx["ved_host"] = c
+        if "herna" in h:
+            idx["herna"] = c
+        if "zacatekut" in h or "zacatek" in h:
+            idx["zacatek"] = c
+        if "konecutkani" in h or "konec" in h:
+            idx["konec"] = c
+
+    raw = {}
+    # najdi řádek týmu
+    r = hdr_row + 1
+    while r <= (setup.max_row or 0):
+        nm = setup.cell(r, idx["name"]).value
+        if nm is None or str(nm).strip() == "":
+            break
+        if str(nm).strip().lower() == team_name.strip().lower():
+            def getraw(key):
+                c = idx.get(key)
+                return setup.cell(r, c).value if c else None
+            raw = {
+                "name":    getraw("name"),
+                "id":      getraw("id"),
+                "ved_dom": getraw("ved_dom"),
+                "ved_host":getraw("ved_host"),
+                "herna":   getraw("herna"),
+                "zacatek_raw": getraw("zacatek"),
+                "konec_raw":   getraw("konec"),
+            }
+            break
+        r += 1
+
+    # vytvoř výstup: RAW vs. parsed
+    out = {
+        "xlsx": str(xlsx_path),
+        "team_query": team_name,
+        "login": {"user": str(login), "pwd_present": bool(pwd)},
+        "team_parsed": team,  # to co uploader skutečně použije
+        "team_raw": raw,      # co je v buňkách
+        "time_debug": {
+            "zacatek_raw": raw.get("zacatek_raw"),
+            "zacatek_parsed": team.get("zacatek"),
+            "konec_raw": raw.get("konec_raw"),
+            "konec_parsed": team.get("konec"),
+        }
+    }
+
+    # log + JSON soubor vedle XLSX
+    log("=== INSPECT XLSX ===")
+    log("Login user:", out["login"]["user"], "pwd_present:", out["login"]["pwd_present"])
+    log("Team RAW:", raw)
+    log("Team PARSED:", team)
+    log("Time RAW/PARSED:", out["time_debug"])
+
+    dump_path = xlsx_path.with_suffix(".parsed.json")
+    try:
+        with open(dump_path, "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2, default=str)
+        log("Uloženo:", dump_path)
+    except Exception as e:
+        log("Uložení JSON selhalo:", repr(e))
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--xlsx", required=True, help="plná cesta k XLSX")
     p.add_argument("--team", required=True, help="název družstva (sloupec 'Družstvo')")
+    p.add_argument("--inspect", action="store_true",
+                   help="pouze načti data z XLSX, vypiš RAW a parsované hodnoty a skonči")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--headed",  dest="headed",  action="store_true",  help="viditelný prohlížeč")
     g.add_argument("--headless", dest="headed", action="store_false", help="bez UI")
@@ -544,7 +632,15 @@ def main():
     log("XLSX:", xlsx_path)
     log("Team:", args.team)
     log("Headed:", getattr(args, "headed", True))
-
+   
+    # >>> NOVĚ – čistě diagnostika vstupu (bez browseru) <<<
+    if getattr(args, "inspect", False):
+        # když půjde jen o kontrolu dat, stačí jednorázová inspekce a konec
+        inspect_xlsx(xlsx_path, args.team, log)
+        log("INSPECT dokončeno – žádný upload neproběhl.")
+        return
+    # <<< konec diagnostiky >>>
+    
     try:
         # 1) načti přihlášení + tým
         user_login, user_pwd, team = read_excel_config(xlsx_path, args.team)
