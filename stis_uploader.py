@@ -235,7 +235,6 @@ def read_zdroj_data(xlsx_path):
 def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     """
     Vyplní online formulář STIS podle skutečné struktury DOM.
-   
     """
     log(
         "fill_online_from_zdroj: start – singles:",
@@ -251,42 +250,82 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
             _dom_dump(page, xlsx_path, log)
         raise
 
-    # ---- ČTYŘHRA #1 (ID: c0) ----
+    # ---- ČTYŘHRA #1 (ID: c0, event index 0) ----
     dbl = data.get("double", {})
     
-    # Domácí hráči čtyřhry
+    # OPRAVENÉ SELEKTORY pro čtyřhru - respektují skutečnou strukturu HTML
+    # První sekce .cell-players má prvního domácího a prvního hosta
     if dbl.get("home1"):
-        _fill_player_by_click(page, "#c0 .cell-player:first-child .player.domaci .player-name", dbl["home1"], log)
-    if dbl.get("home2"):
-        _fill_player_by_click(page, "#c0 .cell-player:last-child .player.domaci .player-name", dbl["home2"], log)
-    
-    # Hostující hráči čtyřhry  
+        _fill_player_by_click(
+            page, 
+            "#c0 .cell-players:first-child .cell-player:first-child .player.domaci .player-name", 
+            dbl["home1"], 
+            log
+        )
     if dbl.get("away1"):
-        _fill_player_by_click(page, "#c0 .cell-player:first-child .player.host .player-name", dbl["away1"], log)
-    if dbl.get("away2"):
-        _fill_player_by_click(page, "#c0 .cell-player:last-child .player.host .player-name", dbl["away2"], log)
+        _fill_player_by_click(
+            page, 
+            "#c0 .cell-players:first-child .cell-player:last-child .player.host .player-name", 
+            dbl["away1"], 
+            log
+        )
     
-    # Sety pro čtyřhru #1 (první .event)
+    # Druhá sekce .cell-players má druhého domácího (hrac2) a druhého hosta (hrac2)
+    if dbl.get("home2"):
+        _fill_player_by_click(
+            page, 
+            "#c0 .cell-players:last-child .cell-player:first-child .player.domaci.hrac2 .player-name", 
+            dbl["home2"], 
+            log
+        )
+    if dbl.get("away2"):
+        _fill_player_by_click(
+            page, 
+            "#c0 .cell-players:last-child .cell-player:last-child .player.host.hrac2 .player-name", 
+            dbl["away2"], 
+            log
+        )
+    
+    # Sety pro čtyřhru #1 (event index 0)
     if dbl.get("sets"):
         _fill_sets_by_event_index(page, 0, dbl["sets"], log)
 
     # ---- SINGLY (d0 až d15) ----
-    # Vaše data mají indexy 2-17, ale DOM má d0-d15, takže index-2 = DOM_ID
+    # Excel má idx 2-17, DOM má d0-d15
+    # V seznamu eventů: čtyřhry zabírají indexy 0,1; singly začínají od indexu 2
+    
     for match_data in data.get("singles", []):
         excel_idx = int(match_data.get("idx", 0))  # 2, 3, 4, ... 17
         if excel_idx < 2 or excel_idx > 17:
             continue
             
-        dom_idx = excel_idx - 2  # 0, 1, 2, ... 15
-        event_idx = excel_idx    # pozice v seznamu eventů (čtyřhry zabírají 0,1, singly začínají od 2)
+        # DOM ID: d0-d15 (excel_idx - 2)
+        dom_idx = excel_idx - 2
+        
+        # Event index: Po dvou čtyřhrách (0,1) následují singly
+        # Excel idx 2 → d0 → event index 2
+        # Excel idx 3 → d1 → event index 3, atd.
+        event_idx = excel_idx
+        
+        log(f"Zpracovávám singl Excel#{excel_idx} → DOM d{dom_idx} → event #{event_idx}")
         
         # Domácí hráč
         if match_data.get("home"):
-            _fill_player_by_click(page, f"#d{dom_idx} .player.domaci .player-name", match_data["home"], log)
+            _fill_player_by_click(
+                page, 
+                f"#d{dom_idx} .player.domaci .player-name", 
+                match_data["home"], 
+                log
+            )
         
         # Hostující hráč    
         if match_data.get("away"):
-            _fill_player_by_click(page, f"#d{dom_idx} .player.host .player-name", match_data["away"], log)
+            _fill_player_by_click(
+                page, 
+                f"#d{dom_idx} .player.host .player-name", 
+                match_data["away"], 
+                log
+            )
         
         # Sety
         if match_data.get("sets"):
@@ -300,7 +339,7 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         log("Změny uloženy.")
     except Exception as e:
         log(f"Uložení selhalo: {repr(e)}")
-
+        
 def boot(msg: str):
     """Zapíš krátkou zprávu ještě před main() – přežije i selhání argparse."""
     line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}\n"
