@@ -23,6 +23,26 @@ ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
+def _norm_name(s: str) -> str:
+    # normalizace jména: zmenší, odstraní diakritiku, srazí vícenásobné mezery
+    s = " ".join((s or "").strip().split()).lower()
+    s = "".join(ch for ch in unicodedata.normalize("NFD", s)
+                if unicodedata.category(ch) != "Mn")
+    return s
+
+def _name_variants(full: str):
+    # vrátí varianty "Jméno Příjmení" i "Příjmení Jméno"
+    parts = [p for p in (full or "").strip().split() if p]
+    if len(parts) >= 2:
+        fn = " ".join(parts[:-1]); ln = parts[-1]
+        return [f"{fn} {ln}", f"{ln} {fn}"]
+    return [full]
+
+def _strip_menu_text(t: str) -> str:
+    # položky menu bývají "Příjmení Jméno (YYYY, Klub...)"
+    # bereme text před závorkou/čárkou/pomlčkou
+    base = re.split(r"[\(\[\-\,]", (t or "").strip(), maxsplit=1)[0].strip()
+    return " ".join(base.split())
 
 def _use_bundled_ms_playwright(log):
     """
@@ -55,78 +75,94 @@ def wait_online_ready(page, log):
 
 def _fill_player_by_click(page, selector, name, log):
     """
-    Klikne na .player-name element a vyplní jméno přes autocomplete.
-    Čeká na autocomplete menu a vybere správnou položku.
+    Klikne na .player-name a z autocomplete vybere POUZE přesnou shodu
+    (bez diakritiky; toleruje obě pořadí jména). Když přesná shoda není,
+    nechá pole prázdné a zaloguje ⚠, nikdy nebere první položku.
     """
     name = (name or "").strip()
     if not name:
         return
-        
+
     try:
-        # 1) Klik na cílový element
         player_elem = page.locator(selector)
         if not player_elem.count():
             log(f"  Nenalezen element: {selector}")
             return
-            
+
+        # otevři input
         player_elem.click(timeout=3000)
-        page.wait_for_timeout(300)
-        
-        # 2) Najdi aktivní autocomplete input
-        autocomplete_selectors = [
-            "input.ui-autocomplete-input:focus",
-            "input.ac_input:focus", 
-            "input[type='text']:focus:not(.zapas-set):not([disabled])"
-        ]
-        
-        input_found = False
-        for sel in autocomplete_selectors:
-            inp = page.locator(sel)
-            if inp.count():
-                # Vyplň jméno
-                inp.fill(name)
-                page.wait_for_timeout(500)  # Počkej na autocomplete
-                
-                # Počkaj na autocomplete menu
-                try:
-                    # jQuery UI autocomplete vytváří ul.ui-autocomplete
-                    page.wait_for_selector("ul.ui-autocomplete:visible", timeout=2000)
-                    
-                    # Najdi položku s přesně stejným textem
-                    # STIS autocomplete může mít formát "Příjmení Jméno" nebo "Jméno Příjmení"
-                    menu_items = page.locator("ul.ui-autocomplete:visible li")
-                    
-                    found_exact = False
-                    for i in range(menu_items.count()):
-                        item_text = menu_items.nth(i).inner_text().strip()
-                        # Porovnej s oběma variantami
-                        if item_text.lower() == name.lower():
-                            menu_items.nth(i).click()
-                            found_exact = True
-                            log(f"  ✓ {name} → {selector} (autocomplete match)")
-                            break
-                    
-                    if not found_exact:
-                        # Fallback - zmáčkni Enter (vybere první)
-                        page.keyboard.press("Enter")
-                        log(f"  ~ {name} → {selector} (autocomplete first)")
-                        
-                except Exception:
-                    # Autocomplete se neobjevilo - zmáčkni Tab
-                    page.keyboard.press("Tab")
-                    log(f"  ~ {name} → {selector} (no autocomplete)")
-                
-                input_found = True
-                break
-                
-        if not input_found:
-            # Fallback: zkus napsat do aktuálně fokusovaného elementu
-            page.keyboard.type(name)
-            page.keyboard.press("Tab")
-            log(f"  ~ {name} → {selector} (fallback)")
-            
+        page.wait_for_timeout(200)
+
+        # najdi aktivní textový input pro autocomplete
+        ac_input = page.locator(
+            "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
+        )
+        if not ac_input.count():
+            # druhý pokus – někdy je třeba klik zopakovat
+            player_elem.click()
+            page.wait_for_timeout(150)
+            ac_input = page.locator(
+                "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
+            )
+            if not ac_input.count():
+                log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
+                return
+
+        # napiš jméno a čekej na menu
+        ac_input.fill(name)
+        page.wait_for_timeout(250)
+
+        def open_menu():
+            try:
+                page.wait_for_selector("ul.ui-autocomplete:visible", timeout=1200)
+                return page.locator("ul.ui-autocomplete:visible li")
+            except Exception:
+                return None
+
+        menu = open_menu()
+
+        want_norms = {_norm_name(v) for v in _name_variants(name)}
+
+        def find_exact(menu_locator):
+            if not menu_locator or menu_locator.count() == 0:
+                return -1
+            n = menu_locator.count()
+            for i in range(n):
+                raw = (menu_locator.nth(i).inner_text() or "").strip()
+                base = _strip_menu_text(raw)
+                if _norm_name(base) in want_norms:
+                    return i
+            return -1
+
+        # 1) přesná shoda pro zadané pořadí
+        idx = find_exact(menu)
+
+        # 2) když nic, zkus opačné pořadí jména
+        if idx < 0:
+            variants = _name_variants(name)
+            if len(variants) == 2:
+                ac_input.fill(variants[1])
+                page.wait_for_timeout(250)
+                menu = open_menu()
+                want_norms = {_norm_name(v) for v in _name_variants(variants[1])}
+                idx = find_exact(menu)
+
+        if idx >= 0:
+            menu.nth(idx).click()
+            page.wait_for_timeout(150)
+            shown = (player_elem.inner_text() or "").strip()
+            if shown and _norm_name(shown) in want_norms:
+                log(f"  ✓ {name} → {selector} (exact match)")
+            else:
+                log(f"  ~ {name} → {selector} vybráno, ale zobrazeno '{shown}'")
+        else:
+            # žádná přesná shoda – NEmačkat Enter; nechat k ruční kontrole
+            page.keyboard.press("Escape")
+            log(f"  ⚠ {name} → nenašel jsem přesnou shodu, ponecháno k ruční kontrole")
+
     except Exception as e:
         log(f"  ✗ {name} → {selector} failed: {repr(e)}")
+
 
 def _fill_sets_by_event_index(page, event_index, sets, log):
     """
