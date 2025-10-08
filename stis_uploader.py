@@ -30,13 +30,6 @@ ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
-def _force_bundled_browsers():
-    # základna vedle EXE (PyInstaller onefile → _MEIPASS), jinak vedle .py
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    mp = base / "ms-playwright"
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(mp)  # KLÍČOVÉ
-    return mp
-
 
 def _norm_name(s: str) -> str:
     # normalizace jména: zmenší, odstraní diakritiku, srazí vícenásobné mezery
@@ -525,29 +518,34 @@ def make_logger(xlsx_path: Path):
     return log, f, log_path
 
 def ensure_pw_browsers(log=None):
-    """Stáhne Chromium pro Playwright, pokud chybí (funguje i z PyInstaller EXE)."""
+    """
+    Preferuj prohlížeče v PLAYWRIGHT_BROWSERS_PATH (tj. přibalené u EXE),
+    jinak použij uživatelský store %LOCALAPPDATA%\ms-playwright.
+    Když tam Chromium chybí, stáhni ho pomocí `playwright install chromium`.
+    """
     default_store = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ms-playwright"
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", str(default_store))
 
-    chromium_ok = False
-    if default_store.exists():
-        for p in default_store.glob("chromium-*/*/chrome.exe"):
-            if p.exists():
-                chromium_ok = True
-                break
+    # 1) Respektuj už nastavenou proměnnou (tu nastavíme z _use_bundled_ms_playwright)
+    store = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or default_store)
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(store)   # výslovně ji nastav
+
+    # 2) Je Chromium už k dispozici?
+    chromium_ok = any(p.exists() for p in store.glob("chromium-*/*/chrome.exe"))
     if chromium_ok:
-        if log: log("Chromium already present in", default_store)
+        if log: log("Chromium already present in", store)
         return
 
-    if log: log("Chromium not found – starting Playwright install (can take minutes)…")
+    # 3) Není → stáhni do právě zvoleného 'store'
+    if log: log("Chromium not found in", store, "– running: playwright install chromium")
     import playwright.__main__ as pw_cli
     old_argv = sys.argv[:]
     try:
         sys.argv = ["playwright", "install", "chromium"]
-        pw_cli.main()   # CLI bere argumenty z sys.argv
+        pw_cli.main()   # CLI čte argumenty ze sys.argv
         if log: log("Playwright install finished.")
     finally:
         sys.argv = old_argv
+
 
 def norm(x) -> str:
     s = "" if x is None else str(x)
@@ -853,6 +851,12 @@ def main():
 
         # nasmět směruj Playwright na přibalené prohlížeče (pokud jsou)
         _used_bundled = _use_bundled_ms_playwright(log)
+        # pokud neběžíme z _MEIPASS, ale je vedle EXE složka ms-playwright, použij ji
+        if not _used_bundled:
+            cand = Path(sys.argv[0]).resolve().parent / "ms-playwright"
+            if cand.exists():
+                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(cand)
+                log("Using side-by-side ms-playwright at:", cand)
 
         with sync_playwright() as p:
             ensure_pw_browsers(log)
