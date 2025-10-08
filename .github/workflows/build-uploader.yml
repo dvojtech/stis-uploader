@@ -1,4 +1,3 @@
-# .github/workflows/build-uploader.yml
 name: build-uploader
 on:
   workflow_dispatch:
@@ -24,10 +23,10 @@ jobs:
           if (Select-String -Path stis_uploader.py -SimpleMatch "`t") {
             throw "Tabs detected in stis_uploader.py – please convert to spaces."
           }
-
+          
       - name: Install deps
         run: |
-          python -m pip install --upgrade pip
+          pip install --upgrade pip
           pip install playwright openpyxl pyinstaller
           python -m playwright install chromium
 
@@ -35,13 +34,24 @@ jobs:
         shell: pwsh
         run: |
           $src = "$env:USERPROFILE\AppData\Local\ms-playwright"
-          if (Test-Path $src) { Copy-Item -Recurse -Force $src ms-playwright }
+          Copy-Item -Recurse -Force $src ms-playwright
 
       - name: Build EXE
-        run: pyinstaller --onefile --noconsole --name stis-uploader --collect-all playwright --add-data "ms-playwright;ms-playwright" stis_uploader.py
+        run: pyinstaller --onefile --noconsole --name "stis-uploader" ^
+              --collect-all playwright ^
+              --add-data "ms-playwright;ms-playwright" ^
+              stis_uploader.py
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist_pkg | Out-Null
+          Copy-Item dist/stis-uploader.exe dist_pkg/
+          Copy-Item -Recurse -Force ms-playwright dist_pkg/ms-playwright
+          Compress-Archive -Path dist_pkg/* -DestinationPath stis-uploader.zip -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: stis-uploader
-          path: dist/stis-uploader.exe
+          path: stis-uploader.zip
