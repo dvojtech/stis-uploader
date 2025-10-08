@@ -822,18 +822,6 @@ def parse_args():
 # Nahraďte celou main() funkci tímto opraveným kódem:
 
 def main():
-    browsers_dir = _force_bundled_browsers()
-    log(f"Browsers dir: {browsers_dir}")
-
-    with sync_playwright() as p:
-        # 1) zkus přibalený Chromium
-        try:
-            browser = p.chromium.launch(headless=False)  # vezme ho z PLAYWRIGHT_BROWSERS_PATH
-            log("Launched bundled Chromium.")
-        except Exception as e:
-            log(f"Bundled Chromium failed: {repr(e)} → trying system Edge")
-            # 2) nouzově Edge (když někde ms-playwright chybí)
-            browser = p.chromium.launch(channel="msedge", headless=False)
     args = parse_args()
     xlsx_path = Path(args.xlsx).resolve()
     if not xlsx_path.exists():
@@ -855,7 +843,7 @@ def main():
         # 1.5) DŮLEŽITÉ: Načti data ze "zdroj" listu
         try:
             zdroj_data = read_zdroj_data(xlsx_path)
-            log("Zdroj data loaded - singles:", len(zdroj_data.get("singles", [])))
+            log("Zdroj data loaded - doubles:", len(zdroj_data.get("doubles", [])), "singles:", len(zdroj_data.get("singles", [])))
         except Exception as e:
             log("WARNING: Nepodařilo se načíst data ze 'zdroj' listu:", repr(e))
             zdroj_data = None
@@ -863,7 +851,7 @@ def main():
         headed = bool(getattr(args, "headed", True))
         headless = not headed
 
-        # nasmě směruj Playwright na přibalené prohlížeče (pokud jsou)
+        # nasmět směruj Playwright na přibalené prohlížeče (pokud jsou)
         _used_bundled = _use_bundled_ms_playwright(log)
 
         with sync_playwright() as p:
@@ -919,12 +907,11 @@ def main():
                 if ":" in start_txt:
                     hh, mm = start_txt.split(":")[:2]
                 else:
-                    hh, mm = "19", "00"  # fallback
+                    hh, mm = "19", "00"
                 
                 hh = int(hh)
                 mm = int(mm)
                 
-                # Vždy nastav čas, i když je chybný v excelu
                 if page.locator("select[name='zapis_zacatek_hodiny']").count():
                     page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
                     log(f"Hodina nastavena: {hh:02d}")
@@ -933,7 +920,6 @@ def main():
                     page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
                     log(f"Minuta nastavena: {mm:02d}")
                     
-                # Důležité: Spusť change event
                 page.evaluate("document.querySelector('select[name=\"zapis_zacatek_hodiny\"]').dispatchEvent(new Event('change'))")
                 page.evaluate("document.querySelector('select[name=\"zapis_zacatek_minuty\"]').dispatchEvent(new Event('change'))")
                 page.wait_for_timeout(500)
@@ -942,7 +928,6 @@ def main():
                 
             except Exception as e:
                 log("Set start time failed:", repr(e))
-                # Nouzové nastavení
                 try:
                     page.select_option("select[name='zapis_zacatek_hodiny']", value="19")
                     page.select_option("select[name='zapis_zacatek_minuty']", value="0")
@@ -979,24 +964,21 @@ def main():
             except Exception as e:
                 log("Vedoucí hostů selhal:", repr(e))
                 
-            # 7) OPRAVA: Vícekrát zkus odeslat formulář dokud nezmizí chyba
+            # 7) Vícekrát zkus odeslat formulář dokud nezmizí chyba
             max_attempts = 3
             for attempt in range(max_attempts):
                 log(f"Pokus {attempt+1}/{max_attempts}: Click 'Uložit a pokračovat'…")
                 
                 try:
-                    # Najdi a klikni na tlačítko
                     btn = page.locator("input[name='odeslat']")
                     if btn.count():
                         btn.click(timeout=5000)
                         page.wait_for_load_state("domcontentloaded")
                         log("Formulář odeslán")
                         
-                        # Zkontroluj, jestli je stále chyba
                         if page.locator(".exception:has-text('není vyplněn začátek utkání')").count():
                             log(f"Pokus {attempt+1}: Server stále hlásí chybu s časem")
                             if attempt < max_attempts - 1:
-                                # Zkus čas nastavit znovu
                                 page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
                                 page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
                                 page.wait_for_timeout(500)
@@ -1012,7 +994,6 @@ def main():
                     
             # 8) Čekej na online editor
             try:
-                # Čekej buď na online.php nebo na přítomnost editovacích prvků
                 page.wait_for_function(
                     "window.location.href.includes('online.php') || document.querySelector('input.zapas-set') !== null",
                     timeout=30000
@@ -1042,8 +1023,7 @@ def main():
                 log("=" * 60)
                 
                 try:
-                    # Čeká, dokud uživatel ručně nezavře okno prohlížeče
-                    page.wait_for_event("close", timeout=0)  # timeout=0 = nekonečné čekání
+                    page.wait_for_event("close", timeout=0)
                     log("Okno prohlížeče bylo zavřeno uživatelem.")
                 except Exception as e:
                     log("Čekání na zavření okna skončilo:", repr(e))
@@ -1059,7 +1039,6 @@ def main():
                     except Exception: 
                         pass
             else:
-                # V headless režimu okno rovnou zavřeme
                 log("Headless režim - zavírám browser automaticky.")
                 try: context.close()
                 except Exception: pass
