@@ -56,6 +56,7 @@ def wait_online_ready(page, log):
 def _fill_player_by_click(page, selector, name, log):
     """
     Klikne na .player-name element a vyplní jméno přes autocomplete.
+    Čeká na autocomplete menu a vybere správnou položku.
     """
     name = (name or "").strip()
     if not name:
@@ -69,7 +70,7 @@ def _fill_player_by_click(page, selector, name, log):
             return
             
         player_elem.click(timeout=3000)
-        page.wait_for_timeout(300)  # Krátká pauza pro aktivaci autocomplete
+        page.wait_for_timeout(300)
         
         # 2) Najdi aktivní autocomplete input
         autocomplete_selectors = [
@@ -82,10 +83,39 @@ def _fill_player_by_click(page, selector, name, log):
         for sel in autocomplete_selectors:
             inp = page.locator(sel)
             if inp.count():
+                # Vyplň jméno
                 inp.fill(name)
-                page.keyboard.press("Tab")  # Nebo Enter pro potvrzení
-                page.wait_for_timeout(200)
-                log(f"  ✓ {name} → {selector}")
+                page.wait_for_timeout(500)  # Počkej na autocomplete
+                
+                # Počkaj na autocomplete menu
+                try:
+                    # jQuery UI autocomplete vytváří ul.ui-autocomplete
+                    page.wait_for_selector("ul.ui-autocomplete:visible", timeout=2000)
+                    
+                    # Najdi položku s přesně stejným textem
+                    # STIS autocomplete může mít formát "Příjmení Jméno" nebo "Jméno Příjmení"
+                    menu_items = page.locator("ul.ui-autocomplete:visible li")
+                    
+                    found_exact = False
+                    for i in range(menu_items.count()):
+                        item_text = menu_items.nth(i).inner_text().strip()
+                        # Porovnej s oběma variantami
+                        if item_text.lower() == name.lower():
+                            menu_items.nth(i).click()
+                            found_exact = True
+                            log(f"  ✓ {name} → {selector} (autocomplete match)")
+                            break
+                    
+                    if not found_exact:
+                        # Fallback - zmáčkni Enter (vybere první)
+                        page.keyboard.press("Enter")
+                        log(f"  ~ {name} → {selector} (autocomplete first)")
+                        
+                except Exception:
+                    # Autocomplete se neobjevilo - zmáčkni Tab
+                    page.keyboard.press("Tab")
+                    log(f"  ~ {name} → {selector} (no autocomplete)")
+                
                 input_found = True
                 break
                 
