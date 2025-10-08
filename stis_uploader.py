@@ -30,6 +30,14 @@ ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
+def _force_bundled_browsers():
+    # základna vedle EXE (PyInstaller onefile → _MEIPASS), jinak vedle .py
+    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
+    mp = base / "ms-playwright"
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(mp)  # KLÍČOVÉ
+    return mp
+
+
 def _norm_name(s: str) -> str:
     # normalizace jména: zmenší, odstraní diakritiku, srazí vícenásobné mezery
     s = " ".join((s or "").strip().split()).lower()
@@ -814,6 +822,18 @@ def parse_args():
 # Nahraďte celou main() funkci tímto opraveným kódem:
 
 def main():
+    browsers_dir = _force_bundled_browsers()
+    log(f"Browsers dir: {browsers_dir}")
+
+    with sync_playwright() as p:
+        # 1) zkus přibalený Chromium
+        try:
+            browser = p.chromium.launch(headless=False)  # vezme ho z PLAYWRIGHT_BROWSERS_PATH
+            log("Launched bundled Chromium.")
+        except Exception as e:
+            log(f"Bundled Chromium failed: {repr(e)} → trying system Edge")
+            # 2) nouzově Edge (když někde ms-playwright chybí)
+            browser = p.chromium.launch(channel="msedge", headless=False)
     args = parse_args()
     xlsx_path = Path(args.xlsx).resolve()
     if not xlsx_path.exists():
