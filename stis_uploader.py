@@ -9,6 +9,13 @@ from openpyxl import load_workbook
 from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as PwTimeout
 
+# --- rychlé timeouty (ms) pro výběr hráčů ---
+FAST_CLICK_MS   = 1200   # klik na cíl / položku menu
+FAST_FOCUS_MS   = 400    # čekání na focused input
+FAST_MENU_MS    = 700    # čekání na zobrazení autocomplete menu
+FAST_PAUSE_MS   = 120    # malé pauzy místo dlouhých sleepů
+MAX_PER_NAME_MS = 2000   # tvrdý rozpočet na 1 jméno (cca 2 s)
+
 # kde EXE skutečně leží
 EXE_DIR = Path(sys.argv[0]).resolve().parent
 # kam určitě umíme zapsat
@@ -75,93 +82,110 @@ def wait_online_ready(page, log):
 
 def _fill_player_by_click(page, selector, name, log):
     """
-    Klikne na .player-name a z autocomplete vybere POUZE přesnou shodu
-    (bez diakritiky; toleruje obě pořadí jména). Když přesná shoda není,
-    nechá pole prázdné a zaloguje ⚠, nikdy nebere první položku.
+    RYCHLÁ verze (≤ ~2 s / jméno):
+      - Klikne na cílový .player-name
+      - Do aktivního inputu napíše jméno
+      - Počká kratce na menu a vybere POUZE přesnou shodu (bez diakritiky).
+      - Pokud přesná shoda není → žádný Enter/first! nechá prázdné a zaloguje ⚠
     """
     name = (name or "").strip()
     if not name:
         return
 
+    start_ts = time.time()
+    def left_budget():
+        return max(0, MAX_PER_NAME_MS/1000.0 - (time.time() - start_ts))
+
     try:
-        player_elem = page.locator(selector)
-        if not player_elem.count():
+        target = page.locator(selector).first
+        if not target.count():
             log(f"  Nenalezen element: {selector}")
             return
 
-        # otevři input
-        player_elem.click(timeout=3000)
-        page.wait_for_timeout(200)
+        # klik do cíle
+        try:
+            target.click(timeout=FAST_CLICK_MS)
+        except Exception:
+            # ještě jeden pokus krátce
+            target.click(timeout=FAST_CLICK_MS)
 
-        # najdi aktivní textový input pro autocomplete
+        page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+
+        # aktivní input (fokus)
         ac_input = page.locator(
             "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
-        )
+        ).first
         if not ac_input.count():
-            # druhý pokus – někdy je třeba klik zopakovat
-            player_elem.click()
-            page.wait_for_timeout(150)
+            # druhý pokus o fokus
+            target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+            page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
             ac_input = page.locator(
                 "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
-            )
+            ).first
             if not ac_input.count():
                 log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
                 return
 
-        # napiš jméno a čekej na menu
-        ac_input.fill(name)
-        page.wait_for_timeout(250)
+        # napiš jméno: TYPE vyvolá keydown/keyup (někdy 'fill' nevyvolá ajax)
+        ac_input.fill("")
+        ac_input.type(name, delay=0)
+        page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
 
-        def open_menu():
-            try:
-                page.wait_for_selector("ul.ui-autocomplete:visible", timeout=1200)
-                return page.locator("ul.ui-autocomplete:visible li")
-            except Exception:
-                return None
-
-        menu = open_menu()
+        # počkej krátce na menu
+        menu = None
+        try:
+            page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
+            menu = page.locator("ul.ui-autocomplete:visible li")
+        except Exception:
+            menu = None
 
         want_norms = {_norm_name(v) for v in _name_variants(name)}
 
-        def find_exact(menu_locator):
-            if not menu_locator or menu_locator.count() == 0:
+        def find_exact(menu_loc):
+            if not menu_loc or menu_loc.count() == 0:
                 return -1
-            n = menu_locator.count()
+            # projdi jen prvních pár (rychlost)
+            n = min(menu_loc.count(), 12)
             for i in range(n):
-                raw = (menu_locator.nth(i).inner_text() or "").strip()
+                raw = (menu_loc.nth(i).inner_text() or "").strip()
                 base = _strip_menu_text(raw)
                 if _norm_name(base) in want_norms:
                     return i
             return -1
 
-        # 1) přesná shoda pro zadané pořadí
         idx = find_exact(menu)
 
-        # 2) když nic, zkus opačné pořadí jména
-        if idx < 0:
+        # 1 rychlý pokus s opačným pořadím, pokud zbývá čas
+        if idx < 0 and left_budget() > 0.4:
             variants = _name_variants(name)
             if len(variants) == 2:
-                ac_input.fill(variants[1])
-                page.wait_for_timeout(250)
-                menu = open_menu()
+                ac_input.fill("")
+                ac_input.type(variants[1], delay=0)
+                page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+                try:
+                    page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
+                    menu = page.locator("ul.ui-autocomplete:visible li")
+                except Exception:
+                    menu = None
                 want_norms = {_norm_name(v) for v in _name_variants(variants[1])}
                 idx = find_exact(menu)
 
         if idx >= 0:
-            menu.nth(idx).click()
-            page.wait_for_timeout(150)
-            shown = (player_elem.inner_text() or "").strip()
+            menu.nth(idx).click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+            # malý check labelu (bez čekání)
+            shown = (target.inner_text() or "").strip()
             if shown and _norm_name(shown) in want_norms:
-                log(f"  ✓ {name} → {selector} (exact match)")
+                log(f"  ✓ {name} → {selector} (exact)")
             else:
                 log(f"  ~ {name} → {selector} vybráno, ale zobrazeno '{shown}'")
         else:
-            # žádná přesná shoda – NEmačkat Enter; nechat k ruční kontrole
+            # rychle ukončit – žádné padání na první položku!
             page.keyboard.press("Escape")
-            log(f"  ⚠ {name} → nenašel jsem přesnou shodu, ponecháno k ruční kontrole")
+            log(f"  ⚠ {name} → bez přesné shody (do 2s), ponecháno k ruční kontrole")
 
     except Exception as e:
         log(f"  ✗ {name} → {selector} failed: {repr(e)}")
+
 
 
 def _fill_sets_by_event_index(page, event_index, sets, log):
