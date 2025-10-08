@@ -30,11 +30,14 @@ ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
+from pathlib import Path
+import os, sys, shutil
+
 def prepare_playwright_browsers(logger):
     """
     Najde přibalené ms-playwright (v _MEIPASS) a jednorázově ho zkopíruje
-    vedle EXE (trvalá cesta). Pak nastaví proměnné tak, aby Playwright
-    používal právě tuto kopii a nikdy nic nestahoval.
+    vedle EXE (trvalá cesta). Potom nastaví proměnné tak, aby Playwright
+    používal právě tuto kopii a automaticky nic nestahoval.
     """
     # adresář, kde běží EXE (nebo .py)
     exe_dir = Path(getattr(sys, "frozen", False) and sys.executable or __file__).resolve().parent
@@ -52,17 +55,20 @@ def prepare_playwright_browsers(logger):
     # preferuj trvalou kopii; když není, použij přímo přibalenou
     root = persistent if persistent.exists() else bundled
 
-    # nastav prostředí a zakaž stahování
+    # nastav prostředí a zakaž automatické stahování při běhu
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root.resolve())
     os.environ["PW_DISABLE_DOWNLOADS"] = "1"
     os.environ.pop("PLAYWRIGHT_DOWNLOAD_HOST", None)
 
-    # log info
-    if (root / ".local-browsers").exists():
+    # log info – najdi chrome(.exe) kdekoli pod root
+    chromes = list(root.rglob("chrome.exe")) + list(root.rglob("chrome"))
+    if chromes:
         logger(f"Using ms-playwright at: {root}")
     else:
-        logger(f"WARNING: {root} neobsahuje .local-browsers/* – chybí zabalené prohlížeče?")
+        logger(f"WARNING: {root} neobsahuje žádný chrome(.exe) – "
+               f"zvaž build s přibalenými prohlížeči nebo jednorázovou instalaci.")
     return root
+
 
 def _norm_name(s: str) -> str:
     # normalizace jména: zmenší, odstraní diakritiku, srazí vícenásobné mezery
@@ -553,8 +559,9 @@ def make_logger(xlsx_path: Path):
 def ensure_pw_browsers(log=None):
     """
     Preferuj prohlížeče v PLAYWRIGHT_BROWSERS_PATH (tj. přibalené u EXE),
-    jinak použij uživatelský store %LOCALAPPDATA%\ms-playwright.
-    Když tam Chromium chybí, stáhni ho pomocí `playwright install chromium`.
+    jinak použij uživatelský store %LOCALAPPDATA%\\ms-playwright.
+    Když tam Chromium chybí, stáhni ho pomocí `playwright install chromium`
+    přímo do téhle cesty.
     """
     default_store = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ms-playwright"
 
@@ -562,20 +569,30 @@ def ensure_pw_browsers(log=None):
     store = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or default_store)
     os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(store)
 
-    chromium_ok = any(p.exists() for p in store.glob("chromium-*/*/chrome.exe"))
-    if chromium_ok:
+    # univerzální detekce: existuje chrome(.exe) kdekoli pod store?
+    has_chrome = any(store.rglob("chrome.exe")) or any(store.rglob("chrome"))
+    if has_chrome:
         if log: log("Chromium already present in", store)
         return
 
     if log: log("Chromium not found in", store, "– running: playwright install chromium")
+
+    # jednorázově povol stáhnutí pro explicitní "install"
     import playwright.__main__ as pw_cli
+    prev_pw_disable = os.environ.pop("PW_DISABLE_DOWNLOADS", None)
     old_argv = sys.argv[:]
     try:
+        store.mkdir(parents=True, exist_ok=True)
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(store)
         sys.argv = ["playwright", "install", "chromium"]
         pw_cli.main()
         if log: log("Playwright install finished.")
     finally:
         sys.argv = old_argv
+        # po instalaci zase zablokuj automatické stahování
+        os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(store)
+        os.environ["PW_DISABLE_DOWNLOADS"] = prev_pw_disable or "1"
+
 
 
 
