@@ -1,5 +1,5 @@
 # stis_uploader.py
-import argparse, os, re, sys, time
+import argparse, os, re, sys, time, shutil
 import unicodedata
 import traceback
 import ctypes
@@ -30,6 +30,39 @@ ZDROJ_SHEET             = "zdroj"
 ZDROJ_FIRST_SINGLE_ROW  = 7     # první řádek singlů (D/E = jména, I—M = sety)
 SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
+def prepare_playwright_browsers(logger):
+    """
+    Najde přibalené ms-playwright (v _MEIPASS) a jednorázově ho zkopíruje
+    vedle EXE (trvalá cesta). Pak nastaví proměnné tak, aby Playwright
+    používal právě tuto kopii a nikdy nic nestahoval.
+    """
+    # adresář, kde běží EXE (nebo .py)
+    exe_dir = Path(getattr(sys, "frozen", False) and sys.executable or __file__).resolve().parent
+    # základna s přibalenými daty při PyInstaller onefile
+    bundled_base = Path(getattr(sys, "_MEIPASS", exe_dir))
+    bundled = bundled_base / "ms-playwright"
+    # trvalá kopie vedle EXE
+    persistent = exe_dir / "ms-playwright"
+
+    # jednorázové kopírování přibalených dat vedle EXE
+    if bundled.exists() and not persistent.exists():
+        logger(f"Copying bundled ms-playwright → {persistent}")
+        shutil.copytree(bundled, persistent)
+
+    # preferuj trvalou kopii; když není, použij přímo přibalenou
+    root = persistent if persistent.exists() else bundled
+
+    # nastav prostředí a zakaž stahování
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(root.resolve())
+    os.environ["PW_DISABLE_DOWNLOADS"] = "1"
+    os.environ.pop("PLAYWRIGHT_DOWNLOAD_HOST", None)
+
+    # log info
+    if (root / ".local-browsers").exists():
+        logger(f"Using ms-playwright at: {root}")
+    else:
+        logger(f"WARNING: {root} neobsahuje .local-browsers/* – chybí zabalené prohlížeče?")
+    return root
 
 def _norm_name(s: str) -> str:
     # normalizace jména: zmenší, odstraní diakritiku, srazí vícenásobné mezery
@@ -525,26 +558,25 @@ def ensure_pw_browsers(log=None):
     """
     default_store = Path(os.environ.get("LOCALAPPDATA", Path.home())) / "ms-playwright"
 
-    # 1) Respektuj už nastavenou proměnnou (tu nastavíme z _use_bundled_ms_playwright)
+    # respektuj už nastavené PLAYWRIGHT_BROWSERS_PATH (nastavuje prepare_playwright_browsers)
     store = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH") or default_store)
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(store)   # výslovně ji nastav
+    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(store)
 
-    # 2) Je Chromium už k dispozici?
     chromium_ok = any(p.exists() for p in store.glob("chromium-*/*/chrome.exe"))
     if chromium_ok:
         if log: log("Chromium already present in", store)
         return
 
-    # 3) Není → stáhni do právě zvoleného 'store'
     if log: log("Chromium not found in", store, "– running: playwright install chromium")
     import playwright.__main__ as pw_cli
     old_argv = sys.argv[:]
     try:
         sys.argv = ["playwright", "install", "chromium"]
-        pw_cli.main()   # CLI čte argumenty ze sys.argv
+        pw_cli.main()
         if log: log("Playwright install finished.")
     finally:
         sys.argv = old_argv
+
 
 
 def norm(x) -> str:
@@ -838,7 +870,7 @@ def main():
         log("Login OK; team:", team["name"], "ID:", team["id"])
         log("Time (XLSX raw → parsed):", repr(team.get("zacatek_raw")), "→", team.get("zacatek"))
 
-        # 1.5) DŮLEŽITÉ: Načti data ze "zdroj" listu
+        # 1.5) data ze "zdroj"
         try:
             zdroj_data = read_zdroj_data(xlsx_path)
             log("Zdroj data loaded - doubles:", len(zdroj_data.get("doubles", [])), "singles:", len(zdroj_data.get("singles", [])))
@@ -849,18 +881,11 @@ def main():
         headed = bool(getattr(args, "headed", True))
         headless = not headed
 
-        # nasmět směruj Playwright na přibalené prohlížeče (pokud jsou)
-        _used_bundled = _use_bundled_ms_playwright(log)
-        # pokud neběžíme z _MEIPASS, ale je vedle EXE složka ms-playwright, použij ji
-        if not _used_bundled:
-            cand = Path(sys.argv[0]).resolve().parent / "ms-playwright"
-            if cand.exists():
-                os.environ["PLAYWRIGHT_BROWSERS_PATH"] = str(cand)
-                log("Using side-by-side ms-playwright at:", cand)
+        # >>> ZDE JE NOVÝ BLOK <<<
+        prepare_playwright_browsers(log)   # nastaví PLAYWRIGHT_BROWSERS_PATH na přibalenou/sousední složku
+        ensure_pw_browsers(log)            # případně doinstaluje Chromium do této složky
 
         with sync_playwright() as p:
-            ensure_pw_browsers(log)
-
             # 2) spuštění prohlížeče (Chromium → Chrome → Edge)
             log("Launching browser… headless =", headless)
             browser = None
@@ -879,6 +904,9 @@ def main():
 
             context = browser.new_context()
             page = context.new_page()
+
+            # ... zbytek main() nech beze změny ...
+
 
             # 3) login
             log("Navigating to login…")
