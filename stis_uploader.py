@@ -166,7 +166,7 @@ def map_wo(s):
         return "-101"
     return t
 def read_zdroj_data(xlsx_path):
-    """Načte čtyřhru a singly z listu 'zdroj' – podle výše uvedených konstant."""
+    """Načte DVĚ čtyřhry a singly z listu 'zdroj' – podle výše uvedených konstant."""
     from openpyxl import load_workbook
     
     wb = load_workbook(xlsx_path, data_only=True)
@@ -189,24 +189,49 @@ def read_zdroj_data(xlsx_path):
     print(f"DEBUG: Načítám data z listu '{ZDROJ_SHEET}'")
     print(f"DEBUG: Max row: {sh.max_row}, Max col: {sh.max_column}")
 
-    # ČTYŘHRA – jména (D2,D3,E2,E3) a sety (I3..M3)
-    double = {
-        "home1": debug_cell(2, 4, "double home1 D2"),
-        "home2": debug_cell(3, 4, "double home2 D3"), 
-        "away1": debug_cell(2, 5, "double away1 E2"),
-        "away2": debug_cell(3, 5, "double away2 E3"),
+    # ČTYŘHRY - DVĚ čtyřhry
+    doubles = []
+    
+    # ČTYŘHRA #1 – jména (D2,D3,E2,E3) a sety (I3..M3)
+    print(f"DEBUG: === Načítám ČTYŘHRU #1 ===")
+    double1 = {
+        "home1": debug_cell(2, 4, "double1 home1 D2"),
+        "home2": debug_cell(3, 4, "double1 home2 D3"), 
+        "away1": debug_cell(2, 5, "double1 away1 E2"),
+        "away2": debug_cell(3, 5, "double1 away2 E3"),
         "sets":  []
     }
     
-    # Sety čtyřhry (I3..M3)
+    # Sety čtyřhry #1 (I3..M3)
     for i in range(5):
         col = 9 + i  # I=9, J=10, K=11, L=12, M=13
-        val = debug_cell(3, col, f"double set{i+1}")
-        double["sets"].append(map_wo(val))
-
-    print(f"DEBUG: Čtyřhra načtena: {double}")
+        val = debug_cell(3, col, f"double1 set{i+1}")
+        double1["sets"].append(map_wo(val))
+    
+    print(f"DEBUG: Čtyřhra #1 načtena: {double1}")
+    doubles.append(double1)
+    
+    # ČTYŘHRA #2 – jména (D4,D5,E4,E5) a sety (I5..M5)
+    print(f"DEBUG: === Načítám ČTYŘHRU #2 ===")
+    double2 = {
+        "home1": debug_cell(4, 4, "double2 home1 D4"),
+        "home2": debug_cell(5, 4, "double2 home2 D5"), 
+        "away1": debug_cell(4, 5, "double2 away1 E4"),
+        "away2": debug_cell(5, 5, "double2 away2 E5"),
+        "sets":  []
+    }
+    
+    # Sety čtyřhry #2 (I5..M5)
+    for i in range(5):
+        col = 9 + i  # I=9, J=10, K=11, L=12, M=13
+        val = debug_cell(5, col, f"double2 set{i+1}")
+        double2["sets"].append(map_wo(val))
+    
+    print(f"DEBUG: Čtyřhra #2 načtena: {double2}")
+    doubles.append(double2)
 
     # SINGLY – indexy 2..(2+SINGLES_COUNT-1) → řádky od ZDROJ_FIRST_SINGLE_ROW
+    print(f"DEBUG: === Načítám SINGLY ===")
     singles = []
     row = ZDROJ_FIRST_SINGLE_ROW
     
@@ -227,8 +252,12 @@ def read_zdroj_data(xlsx_path):
         print(f"DEBUG: Singl {idx}: {single}")
         row += 1
 
-    result = {"double": double, "singles": singles}
-    print(f"DEBUG: Celkem načteno - čtyřhra: {bool(double['home1'] or double['home2'])}, singly: {len([s for s in singles if s['home'] or s['away']])}")
+    result = {"doubles": doubles, "singles": singles}
+    print(f"DEBUG: === SOUHRN ===")
+    print(f"DEBUG: Celkem načteno čtyřher: {len(doubles)}")
+    for i, dbl in enumerate(doubles, 1):
+        print(f"DEBUG:   Čtyřhra #{i}: {bool(dbl['home1'] or dbl['home2'])} (má data)")
+    print(f"DEBUG: Celkem načteno singlů: {len([s for s in singles if s['home'] or s['away']])} (s daty)")
     
     return result
 
@@ -236,11 +265,14 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     """
     Vyplní online formulář STIS podle skutečné struktury DOM.
     """
+    doubles = data.get("doubles", [])
+    singles = data.get("singles", [])
+    
     log(
         "fill_online_from_zdroj: start – singles:",
-        len((data or {}).get("singles", [])),
-        "double:",
-        "ano" if (data or {}).get("double") else "ne"
+        len(singles),
+        "doubles:",
+        len(doubles)
     )
     try:
         wait_online_ready(page, log)
@@ -251,50 +283,93 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         raise
 
     # ---- ČTYŘHRA #1 (ID: c0, event index 0) ----
-    dbl = data.get("double", {})
-    
-    # OPRAVENÉ SELEKTORY pro čtyřhru - respektují skutečnou strukturu HTML
-    # První sekce .cell-players má prvního domácího a prvního hosta
-    if dbl.get("home1"):
-        _fill_player_by_click(
-            page, 
-            "#c0 .cell-players:first-child .cell-player:first-child .player.domaci .player-name", 
-            dbl["home1"], 
-            log
-        )
-    if dbl.get("away1"):
-        _fill_player_by_click(
-            page, 
-            "#c0 .cell-players:first-child .cell-player:last-child .player.host .player-name", 
-            dbl["away1"], 
-            log
-        )
-    
-    # Druhá sekce .cell-players má druhého domácího (hrac2) a druhého hosta (hrac2)
-    if dbl.get("home2"):
-        _fill_player_by_click(
-            page, 
-            "#c0 .cell-players:last-child .cell-player:first-child .player.domaci.hrac2 .player-name", 
-            dbl["home2"], 
-            log
-        )
-    if dbl.get("away2"):
-        _fill_player_by_click(
-            page, 
-            "#c0 .cell-players:last-child .cell-player:last-child .player.host.hrac2 .player-name", 
-            dbl["away2"], 
-            log
-        )
-    
-    # Sety pro čtyřhru #1 (event index 0)
-    if dbl.get("sets"):
-        _fill_sets_by_event_index(page, 0, dbl["sets"], log)
+    if len(doubles) >= 1:
+        dbl = doubles[0]
+        log("Vyplňuji čtyřhru #1 (c0)")
+        
+        # Struktura: #c0 je první .cell-players, pak je druhý .cell-players (bez ID) pro druhé hráče
+        # V každém .cell-players jsou dvě .cell-player (domácí a host)
+        
+        if dbl.get("home1"):
+            _fill_player_by_click(
+                page, 
+                "#c0 .cell-player:first-child .player.domaci .player-name", 
+                dbl["home1"], 
+                log
+            )
+        if dbl.get("away1"):
+            _fill_player_by_click(
+                page, 
+                "#c0 .cell-player:last-child .player.host .player-name", 
+                dbl["away1"], 
+                log
+            )
+        
+        # Druhá dvojice - je v dalším .cell-players (sourozenec #c0)
+        if dbl.get("home2"):
+            _fill_player_by_click(
+                page, 
+                "#c0 + .cell-players .cell-player:first-child .player.domaci.hrac2 .player-name", 
+                dbl["home2"], 
+                log
+            )
+        if dbl.get("away2"):
+            _fill_player_by_click(
+                page, 
+                "#c0 + .cell-players .cell-player:last-child .player.host.hrac2 .player-name", 
+                dbl["away2"], 
+                log
+            )
+        
+        # Sety pro čtyřhru #1 (event index 0)
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 0, dbl["sets"], log)
+
+    # ---- ČTYŘHRA #2 (ID: c1, event index 1) ----
+    if len(doubles) >= 2:
+        dbl = doubles[1]
+        log("Vyplňuji čtyřhru #2 (c1)")
+        
+        if dbl.get("home1"):
+            _fill_player_by_click(
+                page, 
+                "#c1 .cell-player:first-child .player.domaci .player-name", 
+                dbl["home1"], 
+                log
+            )
+        if dbl.get("away1"):
+            _fill_player_by_click(
+                page, 
+                "#c1 .cell-player:last-child .player.host .player-name", 
+                dbl["away1"], 
+                log
+            )
+        
+        # Druhá dvojice - je v dalším .cell-players (sourozenec #c1)
+        if dbl.get("home2"):
+            _fill_player_by_click(
+                page, 
+                "#c1 + .cell-players .cell-player:first-child .player.domaci.hrac2 .player-name", 
+                dbl["home2"], 
+                log
+            )
+        if dbl.get("away2"):
+            _fill_player_by_click(
+                page, 
+                "#c1 + .cell-players .cell-player:last-child .player.host.hrac2 .player-name", 
+                dbl["away2"], 
+                log
+            )
+        
+        # Sety pro čtyřhru #2 (event index 1)
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 1, dbl["sets"], log)
 
     # ---- SINGLY (d0 až d15) ----
     # Excel má idx 2-17, DOM má d0-d15
     # V seznamu eventů: čtyřhry zabírají indexy 0,1; singly začínají od indexu 2
     
-    for match_data in data.get("singles", []):
+    for match_data in singles:
         excel_idx = int(match_data.get("idx", 0))  # 2, 3, 4, ... 17
         if excel_idx < 2 or excel_idx > 17:
             continue
