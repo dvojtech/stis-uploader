@@ -122,121 +122,87 @@ def wait_online_ready(page, log):
 
 def _fill_player_by_click(page, selector, name, log):
     """
-    Rychlý picker: klik na .player (ne .player-name), fokus do inputu,
-    napsání jména, výběr přes autocomplete (exact match).
+    FAST picker s JS klikem (obchází viditelnost)
     """
     name = (name or "").strip()
     if not name:
         return
-
-    # 1) pokud někdo předá .player-name, přemapuj na .player
-    sel = re.sub(r"\.player-name\b", ".player", selector)
 
     start_ts = time.time()
     def left_budget():
         return max(0, MAX_PER_NAME_MS/1000.0 - (time.time() - start_ts))
 
     try:
-        target = page.locator(sel).first
+        target = page.locator(selector).first
         if not target.count():
-            log(f"  Nenalezen element: {sel}")
+            log(f"  Nenalezen element: {selector}")
             return
 
-        # zajisti viditelnost + klik
-        try:
-            target.scroll_into_view_if_needed(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
-        except Exception:
-            pass
-
-        # klik (i kdyby Playwright tvrdil, že není „actionable“)
-        target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)), force=True)
+        # KLÍČOVÁ ZMĚNA: JavaScript klik (100% obejde kontroly viditelnosti)
+        page.evaluate(f"""
+            document.querySelector('{selector}').click();
+        """)
         page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
 
-        # najdi aktivní input (autocomplete)
+        # aktivní input (fokus)
         ac_input = page.locator(
             "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
         ).first
         if not ac_input.count():
-            # druhý pokus – zkusíme ještě jednou „aktivovat“ buňku
-            target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)), force=True)
+            # druhý pokus
+            page.evaluate(f"""
+                document.querySelector('{selector}').click();
+            """)
             page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
             ac_input = page.locator(
                 "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
             ).first
             if not ac_input.count():
-                log(f"  ✗ {name} → žádný aktivní input (selector {sel})")
+                log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
                 return
 
-        # napiš jméno (TYPE spolehlivě vyvolá ajax)
+        # napiš jméno
         ac_input.fill("")
         ac_input.type(name, delay=0)
 
-        # krátce počkej na menu
+        # počkej KRÁTCE na menu
         try:
             page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
         except Exception:
-            # fallback: jeden ArrowDown+Enter (některé prohlížeče menu zpozdí)
-            page.keyboard.press("ArrowDown")
-            page.keyboard.press("Enter")
-            shown = (target.inner_text() or "").strip()
-            if shown and name.lower() in shown.lower():
-                log(f"  ~ {name} → fallback výběr (bez menu), zobrazeno '{shown}'")
-            else:
-                page.keyboard.press("Escape")
-                log(f"  ⚠ {name} → menu se do {FAST_MENU_MS} ms neukázalo, ponecháno k ruční kontrole")
+            page.keyboard.press("Escape")
+            log(f"  ⚠ {name} → menu se do {FAST_MENU_MS} ms neukázalo, ponecháno k ruční kontrole")
             return
 
-        # najdi přesnou shodu (bez diakritiky, obě pořadí Jméno Příjmení / Příjmení Jméno)
-        want_norms = {_norm_name(v) for v in _name_variants(name)}
-        menu = page.locator("ul.ui-autocomplete:visible li")
-        n = min(menu.count(), 12)
+        # přímý výběr přes has_text
+        opt = page.locator("ul.ui-autocomplete:visible li", has_text=name).first
+        if not opt.count():
+            # zkus opačné pořadí
+            if left_budget() > 0.3:
+                parts = name.split()
+                if len(parts) >= 2:
+                    rev = f"{parts[-1]} {' '.join(parts[:-1])}"
+                    ac_input.fill("")
+                    ac_input.type(rev, delay=0)
+                    try:
+                        page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
+                        opt = page.locator("ul.ui-autocomplete:visible li", has_text=rev).first
+                    except Exception:
+                        opt = None
 
-        def base_text(i):
-            raw = (menu.nth(i).inner_text() or "").strip()
-            base = _strip_menu_text(raw)
-            return base
-
-        idx = -1
-        for i in range(n):
-            if _norm_name(base_text(i)) in want_norms:
-                idx = i
-                break
-
-        # jeden rychlý pokus s opačným pořadím, pokud nic
-        if idx < 0 and left_budget() > 0.4:
-            variants = _name_variants(name)
-            if len(variants) == 2:
-                ac_input.fill("")
-                ac_input.type(variants[1], delay=0)
-                page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
-                menu = page.locator("ul.ui-autocomplete:visible li")
-                n = min(menu.count(), 12)
-                want_norms = {_norm_name(v) for v in _name_variants(variants[1])}
-                for i in range(n):
-                    if _norm_name(base_text(i)) in want_norms:
-                        idx = i
-                        break
-
-        if idx >= 0:
-            menu.nth(idx).click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+        if opt and opt.count():
+            opt.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+            # rychlá kontrola labelu
             shown = (target.inner_text() or "").strip()
-            if shown and any(_norm_name(shown) == _norm_name(v) for v in _name_variants(name)):
-                log(f"  ✓ {name} → {sel} (exact)")
+            if shown and name.lower() in shown.lower():
+                log(f"  ✓ {name} → {selector}")
             else:
-                log(f"  ~ {name} → {sel} vybráno, ale zobrazeno '{shown}'")
+                log(f"  ~ {name} → vybráno, ale zobrazeno '{shown}'")
         else:
-            # necháme k ruční kontrole, ale ať se „něco“ vybere
-            page.keyboard.press("ArrowDown")
-            page.keyboard.press("Enter")
-            shown = (target.inner_text() or "").strip()
-            if shown and shown != "----":
-                log(f"  ~ {name} → fallback výběr '{shown}' (bez přesné shody)")
-            else:
-                page.keyboard.press("Escape")
-                log(f"  ⚠ {name} → bez přesné shody, ponecháno k ruční kontrole")
+            page.keyboard.press("Escape")
+            log(f"  ⚠ {name} → položka s přesným textem nebyla v menu, ponecháno k ruční kontrole")
 
     except Exception as e:
-        log(f"  ✗ {name} → {sel} failed: {repr(e)}")
+        log(f"  ✗ {name} → {selector} failed: {repr(e)}")
 
 
 def _fill_sets_by_event_index(page, event_index, sets, log):
