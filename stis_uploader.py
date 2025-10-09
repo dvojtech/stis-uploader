@@ -122,95 +122,92 @@ def wait_online_ready(page, log):
 
 def _fill_player_by_click(page, selector, name, log):
     """
-    FAST picker - klikne na PARENT .player element (tam je onclick handler)
+    Jednoduchá verze s delší pauzou a opakovanými pokusy
     """
     name = (name or "").strip()
     if not name:
         return
 
-    start_ts = time.time()
-    def left_budget():
-        return max(0, MAX_PER_NAME_MS/1000.0 - (time.time() - start_ts))
-
     try:
-        # KLÍČOVÁ ZMĚNA: Najdi .player-name ale klikni na jeho parent .player
-        target_name = page.locator(selector).first
-        if not target_name.count():
+        # Najdi .player-name element
+        target = page.locator(selector).first
+        if not target.count():
             log(f"  Nenalezen element: {selector}")
             return
 
-        # Najdi parent .player element
-        parent_selector = selector.rsplit('.player-name', 1)[0]  # Odstraň .player-name z konce
-        target_player = page.locator(parent_selector).first
-        
-        if not target_player.count():
-            log(f"  Nenalezen parent: {parent_selector}")
-            return
+        # POKUS 1: Normální Playwright klik s force=True a DELŠÍ pauzou
+        try:
+            target.click(timeout=1200, force=True)
+            page.wait_for_timeout(200)  # DELŠÍ pauza!
+        except Exception:
+            # POKUS 2: Ještě jeden pokus
+            try:
+                target.click(timeout=1200, force=True)
+                page.wait_for_timeout(200)
+            except Exception as e:
+                log(f"  ✗ {name} → klik selhal: {repr(e)[:80]}")
+                return
 
-        # Klikni na parent přes JavaScript (tam je onclick)
-        page.evaluate(f"""
-            document.querySelector('{parent_selector}').click();
-        """)
-        page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
-
-        # aktivní input (fokus)
-        ac_input = page.locator(
-            "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
-        ).first
-        
-        if not ac_input.count():
-            # druhý pokus
-            page.evaluate(f"""
-                document.querySelector('{parent_selector}').click();
-            """)
-            page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+        # Hledej aktivní input s DELŠÍM timeoutem
+        ac_input = None
+        try:
+            page.wait_for_selector(
+                "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus",
+                timeout=600
+            )
             ac_input = page.locator(
                 "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
             ).first
-            
-            if not ac_input.count():
-                log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
-                return
-
-        # napiš jméno
-        ac_input.fill("")
-        ac_input.type(name, delay=0)
-
-        # počkej KRÁTCE na menu
-        try:
-            page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
         except Exception:
-            page.keyboard.press("Escape")
-            log(f"  ⚠ {name} → menu se do {FAST_MENU_MS} ms neukázalo")
+            pass
+
+        if not ac_input or not ac_input.count():
+            log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
             return
 
-        # přímý výběr přes has_text
+        # Napiš jméno
+        ac_input.fill("")
+        page.wait_for_timeout(50)
+        ac_input.type(name, delay=0)
+        page.wait_for_timeout(100)
+
+        # Počkej na menu
+        try:
+            page.wait_for_selector("ul.ui-autocomplete:visible", timeout=700)
+        except Exception:
+            page.keyboard.press("Escape")
+            log(f"  ⚠ {name} → menu se neukázalo")
+            return
+
+        # Vyber přesnou shodu
         opt = page.locator("ul.ui-autocomplete:visible li", has_text=name).first
+        
         if not opt.count():
-            # zkus opačné pořadí
-            if left_budget() > 0.3:
-                parts = name.split()
-                if len(parts) >= 2:
-                    rev = f"{parts[-1]} {' '.join(parts[:-1])}"
-                    ac_input.fill("")
-                    ac_input.type(rev, delay=0)
-                    try:
-                        page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
-                        opt = page.locator("ul.ui-autocomplete:visible li", has_text=rev).first
-                    except Exception:
-                        opt = None
+            # Zkus opačné pořadí
+            parts = name.split()
+            if len(parts) >= 2:
+                rev = f"{parts[-1]} {' '.join(parts[:-1])}"
+                ac_input.fill("")
+                page.wait_for_timeout(50)
+                ac_input.type(rev, delay=0)
+                page.wait_for_timeout(100)
+                try:
+                    page.wait_for_selector("ul.ui-autocomplete:visible", timeout=700)
+                    opt = page.locator("ul.ui-autocomplete:visible li", has_text=rev).first
+                except Exception:
+                    opt = None
 
         if opt and opt.count():
-            opt.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
-            # kontrola
-            shown = (target_name.inner_text() or "").strip()
+            opt.click(timeout=1200)
+            page.wait_for_timeout(100)
+            shown = (target.inner_text() or "").strip()
             if shown and name.lower() in shown.lower():
                 log(f"  ✓ {name} → {selector}")
             else:
-                log(f"  ~ {name} → vybráno, ale zobrazeno '{shown}'")
+                log(f"  ~ {name} → vybráno '{shown}'")
         else:
             page.keyboard.press("Escape")
-            log(f"  ⚠ {name} → bez přesné shody")
+            log(f"  ⚠ {name} → bez přesné shody v menu")
 
     except Exception as e:
         log(f"  ✗ {name} → {selector} failed: {repr(e)}")
