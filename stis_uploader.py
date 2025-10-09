@@ -122,7 +122,7 @@ def wait_online_ready(page, log):
 
 def _fill_player_by_click(page, selector, name, log):
     """
-    FAST picker s JS klikem (obchází viditelnost)
+    FAST picker - klikne na PARENT .player element (tam je onclick handler)
     """
     name = (name or "").strip()
     if not name:
@@ -133,14 +133,23 @@ def _fill_player_by_click(page, selector, name, log):
         return max(0, MAX_PER_NAME_MS/1000.0 - (time.time() - start_ts))
 
     try:
-        target = page.locator(selector).first
-        if not target.count():
+        # KLÍČOVÁ ZMĚNA: Najdi .player-name ale klikni na jeho parent .player
+        target_name = page.locator(selector).first
+        if not target_name.count():
             log(f"  Nenalezen element: {selector}")
             return
 
-        # KLÍČOVÁ ZMĚNA: JavaScript klik (100% obejde kontroly viditelnosti)
+        # Najdi parent .player element
+        parent_selector = selector.rsplit('.player-name', 1)[0]  # Odstraň .player-name z konce
+        target_player = page.locator(parent_selector).first
+        
+        if not target_player.count():
+            log(f"  Nenalezen parent: {parent_selector}")
+            return
+
+        # Klikni na parent přes JavaScript (tam je onclick)
         page.evaluate(f"""
-            document.querySelector('{selector}').click();
+            document.querySelector('{parent_selector}').click();
         """)
         page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
 
@@ -148,15 +157,17 @@ def _fill_player_by_click(page, selector, name, log):
         ac_input = page.locator(
             "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
         ).first
+        
         if not ac_input.count():
             # druhý pokus
             page.evaluate(f"""
-                document.querySelector('{selector}').click();
+                document.querySelector('{parent_selector}').click();
             """)
             page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
             ac_input = page.locator(
                 "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
             ).first
+            
             if not ac_input.count():
                 log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
                 return
@@ -170,7 +181,7 @@ def _fill_player_by_click(page, selector, name, log):
             page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
         except Exception:
             page.keyboard.press("Escape")
-            log(f"  ⚠ {name} → menu se do {FAST_MENU_MS} ms neukázalo, ponecháno k ruční kontrole")
+            log(f"  ⚠ {name} → menu se do {FAST_MENU_MS} ms neukázalo")
             return
 
         # přímý výběr přes has_text
@@ -191,19 +202,18 @@ def _fill_player_by_click(page, selector, name, log):
 
         if opt and opt.count():
             opt.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
-            # rychlá kontrola labelu
-            shown = (target.inner_text() or "").strip()
+            # kontrola
+            shown = (target_name.inner_text() or "").strip()
             if shown and name.lower() in shown.lower():
                 log(f"  ✓ {name} → {selector}")
             else:
                 log(f"  ~ {name} → vybráno, ale zobrazeno '{shown}'")
         else:
             page.keyboard.press("Escape")
-            log(f"  ⚠ {name} → položka s přesným textem nebyla v menu, ponecháno k ruční kontrole")
+            log(f"  ⚠ {name} → bez přesné shody")
 
     except Exception as e:
         log(f"  ✗ {name} → {selector} failed: {repr(e)}")
-
 
 def _fill_sets_by_event_index(page, event_index, sets, log):
     """
