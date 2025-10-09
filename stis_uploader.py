@@ -122,11 +122,7 @@ def wait_online_ready(page, log):
 
 def _fill_player_by_click(page, selector, name, log):
     """
-    FAST picker (≤ ~1.5 s / jméno):
-      - klikne do cíle (.player-name),
-      - napíše jméno,
-      - z menu vybere POUZE položku, která obsahuje přesně tento text (has_text),
-      - žádný Enter/first fallback; když se přesná položka rychle neobjeví, nechá prázdné.
+    FAST picker s vynuceným klikem i na skryté elementy
     """
     name = (name or "").strip()
     if not name:
@@ -142,8 +138,8 @@ def _fill_player_by_click(page, selector, name, log):
             log(f"  Nenalezen element: {selector}")
             return
 
-        # klik do cíle (otevře input)
-        target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+        # KLÍČOVÁ ZMĚNA: force=True - klikne i na neviditelný element
+        target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)), force=True)
         page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
 
         # aktivní input (fokus)
@@ -152,7 +148,7 @@ def _fill_player_by_click(page, selector, name, log):
         ).first
         if not ac_input.count():
             # jeden rychlý pokus o refokus
-            target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+            target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)), force=True)
             page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
             ac_input = page.locator(
                 "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
@@ -169,15 +165,14 @@ def _fill_player_by_click(page, selector, name, log):
         try:
             page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
         except Exception:
-            # menu se rychle neukázalo → nedělat pomalé fallbacky
             page.keyboard.press("Escape")
             log(f"  ⚠ {name} → menu se do {FAST_MENU_MS} ms neukázalo, ponecháno k ruční kontrole")
             return
 
-        # přímý výběr přes has_text (nejrychlejší cesta)
+        # přímý výběr přes has_text
         opt = page.locator("ul.ui-autocomplete:visible li", has_text=name).first
         if not opt.count():
-            # zkus opačné pořadí (Příjmení Jméno), jen když ještě je čas
+            # zkus opačné pořadí
             if left_budget() > 0.3:
                 parts = name.split()
                 if len(parts) >= 2:
@@ -192,14 +187,13 @@ def _fill_player_by_click(page, selector, name, log):
 
         if opt and opt.count():
             opt.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
-            # rychlá kontrola labelu (bez čekání)
+            # rychlá kontrola labelu
             shown = (target.inner_text() or "").strip()
             if shown and name.lower() in shown.lower():
                 log(f"  ✓ {name} → {selector}")
             else:
                 log(f"  ~ {name} → vybráno, ale zobrazeno '{shown}'")
         else:
-            # neriskovat chybný výběr
             page.keyboard.press("Escape")
             log(f"  ⚠ {name} → položka s přesným textem nebyla v menu, ponecháno k ruční kontrole")
 
