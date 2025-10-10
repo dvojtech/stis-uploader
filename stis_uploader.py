@@ -106,6 +106,104 @@ def prepare_playwright_browsers(logger):
                f"zvaž build s přibalenými prohlížeči nebo jednorázovou instalaci.")
     return root
 
+def fill_online_from_zdroj(page, data, log, xlsx_path=None):
+    """
+    Vyplní online formulář STIS podle dat ze 'zdroj'.
+    Očekává data z read_zdroj_data(xlsx_path, log).
+    """
+    doubles = (data or {}).get("doubles", []) or []
+    singles = (data or {}).get("singles", []) or []
+
+    log("fill_online_from_zdroj: start – singles:", len(singles), "doubles:", len(doubles))
+
+    # 1) čekej na připravenost editoru
+    try:
+        wait_online_ready(page, log)
+    except Exception:
+        log("Inputs se neobjevily – dělám dump DOMu.")
+        if xlsx_path:
+            try: _dom_dump(page, xlsx_path, log)
+            except Exception as e_dump: log(f"DOM dump selhal: {e_dump!r}")
+        raise
+
+    # 2) CSS hack – odhrň překryv ikony karty a vynucená viditelnost labelů
+    page.add_style_tag(content="""
+      .button-karta, .button-karta * { pointer-events: none !important; }
+      .player-name { visibility: visible !important; opacity: 1 !important; }
+    """)
+    log("CSS hack pro .button-karta a .player-name aplikován.")
+
+    # ==== ČTYŘHRA #1 (c0) ====
+    if len(doubles) >= 1:
+        dbl = doubles[0]
+        log("Vyplňuji čtyřhru #1 (c0)")
+
+        if dbl.get("home1"):
+            log(f"[c0] home1 sel=#c0 .cell-player:first-child  name={dbl['home1']!r}")
+            _fill_player_by_click(page, "#c0 .cell-player:first-child", dbl["home1"], log)
+        if dbl.get("away1"):
+            log(f"[c0] away1 sel=#c0 .cell-player:last-child   name={dbl['away1']!r}")
+            _fill_player_by_click(page, "#c0 .cell-player:last-child",  dbl["away1"], log)
+
+        if dbl.get("home2"):
+            log(f"[c0] home2 sel=#c0 + .cell-players .cell-player:first-child  name={dbl['home2']!r}")
+            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:first-child", dbl["home2"], log)
+        if dbl.get("away2"):
+            log(f"[c0] away2 sel=#c0 + .cell-players .cell-player:last-child   name={dbl['away2']!r}")
+            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:last-child",  dbl["away2"], log)
+
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 0, dbl["sets"], log)
+
+    # ==== ČTYŘHRA #2 (c1) ====
+    if len(doubles) >= 2:
+        dbl = doubles[1]
+        log("Vyplňuji čtyřhru #2 (c1)")
+
+        if dbl.get("home1"):
+            log(f"[c1] home1 sel=#c1 .cell-player:first-child  name={dbl['home1']!r}")
+            _fill_player_by_click(page, "#c1 .cell-player:first-child", dbl["home1"], log)
+        if dbl.get("away1"):
+            log(f"[c1] away1 sel=#c1 .cell-player:last-child   name={dbl['away1']!r}")
+            _fill_player_by_click(page, "#c1 .cell-player:last-child",  dbl["away1"], log)
+
+        if dbl.get("home2"):
+            log(f"[c1] home2 sel=#c1 + .cell-players .cell-player:first-child  name={dbl['home2']!r}")
+            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:first-child", dbl["home2"], log)
+        if dbl.get("away2"):
+            log(f"[c1] away2 sel=#c1 + .cell-players .cell-player:last-child   name={dbl['away2']!r}")
+            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:last-child",  dbl["away2"], log)
+
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 1, dbl["sets"], log)
+
+    # ==== SINGLY d0..d15 (Excel idx 2..17) ====
+    for s in singles:
+        idx = int(s.get("idx", 0))  # 2..17
+        if not (2 <= idx <= 17):
+            continue
+        dom_idx = idx - 2           # 0..15 → #d{dom_idx}
+
+        log(f"Zpracovávám singl Excel#{idx} → DOM d{dom_idx} → event #{idx}")
+
+        if s.get("home"):
+            log(f"[d{dom_idx}] home sel=#d{dom_idx} .cell-player:first-child  name={s['home']!r}")
+            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:first-child", s["home"], log)
+        if s.get("away"):
+            log(f"[d{dom_idx}] away sel=#d{dom_idx} .cell-player:last-child   name={s['away']!r}")
+            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:last-child",  s["away"], log)
+
+        if s.get("sets"):
+            _fill_sets_by_event_index(page, idx, s["sets"], log)
+
+    # Ulož
+    log("Klikám 'Uložit změny'…")
+    try:
+        page.locator("input[name='ulozit']").click(timeout=5000)
+        page.wait_for_timeout(1000)
+        log("Změny uloženy.")
+    except Exception as e:
+        log(f"Uložení selhalo: {e!r}")
 
 def _norm_name(s: str) -> str:
     # normalizace jména: zmenší, odstraní diakritiku, srazí vícenásobné mezery
@@ -175,160 +273,110 @@ def _any_input_in_zapis(page):
 def _diag_dump_cell(page, target, tag, log):
     try:
         ts = int(time.time()*1000)
-        # screenshot buňky
         cell_png = DIAG_DIR / f"{tag}_cell_{ts}.png"
+        page_png = DIAG_DIR / f"{tag}_zapis_{ts}.png"
+        html_snip = DIAG_DIR / f"{tag}_snippet_{ts}.html"
+
+        page.locator("#zapis").first.screenshot(path=str(page_png))
         target.screenshot(path=str(cell_png))
-        # screenshot celé oblasti
-        all_png = DIAG_DIR / f"{tag}_zapis_{ts}.png"
-        page.locator("#zapis").first.screenshot(path=str(all_png))
-        # aktivní element + krátký HTML okolí
-        ae = page.evaluate("() => (document.activeElement && document.activeElement.outerHTML) || null")
-        outer = page.evaluate("(el) => el.outerHTML", target)
-        snip = DIAG_DIR / f"{tag}_snippet_{ts}.html"
-        with open(snip, "w", encoding="utf-8") as f:
-            f.write("<h3>activeElement</h3>\n<pre>")
-            f.write((ae or "NULL"))
-            f.write("</pre>\n<h3>cell outerHTML</h3>\n")
+
+        ae = page.evaluate("() => document.activeElement ? document.activeElement.outerHTML : null")
+        outer = target.evaluate("el => el.outerHTML")  # ← klíčová změna
+
+        with open(html_snip, "w", encoding="utf-8") as f:
+            f.write("<h3>activeElement</h3><pre>")
+            f.write(ae or "NULL")
+            f.write("</pre><h3>cell outerHTML</h3>")
             f.write(outer)
-        log(f"  [diag] uložené: {cell_png.name}, {all_png.name}, {snip.name}")
+
+        log(f"  [diag] uložené: {cell_png.name}, {page_png.name}, {html_snip.name}")
     except Exception as e:
         log(f"  [diag] dump selhal: {e!r}")
+
         
 def _fill_player_by_click(page, selector, name, log):
+    """
+    Klikne na BUŇKU hráče (ne na .player-name), vyvolá input a zkusí vybrat jméno.
+    """
     name = (name or "").strip()
     if not name:
         return
 
-    # ⬇⬇⬇ NOVÉ: přemapování na kontejner buňky ⬇⬇⬇
-    # tvé selektory teď míří na ... .player-name; my klikneme o úroveň výš – na .cell-player
+    # 1) odvoď cílovou buňku
     cell_sel = None
-    if " .cell-player:first-child " in selector or " .cell-player:last-child " in selector:
-        # čtyřhry – už tam buňku máš
-        cell_sel = selector.split(" .player", 1)[0]  # ořízni od " .player..." dál
+    if " .cell-player:first-child" in selector or " .cell-player:last-child" in selector:
+        cell_sel = selector.split(" .player", 1)[0]
     elif "#d" in selector:
-        # singly – přemapuj #dX .player.domaci/host .player-name -> #dX .cell-player:first-child/last-child
-        # domácí:
         if ".player.domaci " in selector:
             cell_sel = selector.split(" .player", 1)[0].replace(".player.domaci", ".cell-player:first-child")
-        # host:
         if ".player.host " in selector:
-            cell_sel = selector.split(" .player", 1)[0].replace(".player.host", ".cell-player:last-child")
+            cell_sel = selector.split(" .player", 1)[0].replace(".player.host",   ".cell-player:last-child")
 
-    # fallback: když by nic nevyšlo, klikneme aspoň na původní target
-    click_target = page.locator(cell_sel).first if cell_sel else page.locator(selector).first
+    target = page.locator(cell_sel).first if cell_sel else page.locator(selector).first
+    if not target.count():
+        log(f"  ✗ {name} → Nenalezen element: {cell_sel or selector}")
+        return
 
+    # 2) klik (s force) + fokus inputu (nejprve v buňce, pak v #zapis)
     try:
-        # zajisti zorné pole
-        try:
-            click_target.scroll_into_view_if_needed(timeout=800)
-        except Exception:
-            pass
+        try: target.scroll_into_view_if_needed(timeout=800)
+        except Exception: pass
 
-        # ⬇⬇⬇ DŮLEŽITÉ: force=True obejde „not visible/actionable“ ⬇⬇⬇
-        click_target.click(timeout=800, force=True)
+        target.click(timeout=800, force=True)
         page.wait_for_timeout(150)
 
-        # input hledej nejdřív v té buňce, pak v #zapis, pak globálně
-        ac_input = click_target.locator(
-            "input.ui-autocomplete-input, input.ac_input, input[type='text']"
-        ).first
+        ac_input = target.locator("input.ui-autocomplete-input, input.ac_input, input[type='text']").first
         if not ac_input.count():
-            ac_input = page.locator(
-                "#zapis input.ui-autocomplete-input, #zapis input.ac_input, #zapis input[type='text']"
-            ).first
-        if not ac_input.count():
-            ac_input = page.locator(
-                "input.ui-autocomplete-input:visible, input.ac_input:visible, input[type='text']:visible"
-            ).first
+            ac_input = page.locator("#zapis input.ui-autocomplete-input:visible, #zapis input.ac_input:visible, #zapis input[type='text']:visible").first
 
         if not ac_input.count():
             log(f"  ✗ {name} → žádný input (selector {selector} → {cell_sel or selector})")
+            _diag_dump_cell(page, target, f"noinput_{_norm_name(name)}", log)
             return
 
-        # ... a tady pokračuj tvým původním kódem (fill/type, čekání na menu, výběr, logování)
+        # 3) napiš jméno a zkus menu
         ac_input.fill("")
         ac_input.type(name, delay=0)
-        # (zbytek tvé logiky beze změn)
-        # ...
-    except Exception as e:
-        log(f"  ✗ {name} → klik/focus selhal: {e!r}")
-
-
-        # aktivní input (fokus)
-        ac_input = page.locator(
-            "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
-        ).first
-        if not ac_input.count():
-            # druhý pokus o fokus
-            target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
-            page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
-            ac_input = page.locator(
-                "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
-            ).first
-            if not ac_input.count():
-                log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
-                return
-
-        # napiš jméno: TYPE vyvolá keydown/keyup (někdy 'fill' nevyvolá ajax)
-        ac_input.fill("")
-        ac_input.type(name, delay=0)
-        page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
-
-        # počkej krátce na menu
-        menu = None
-        try:
-            page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
-            menu = page.locator("ul.ui-autocomplete:visible li")
-        except Exception:
-            menu = None
 
         want_norms = {_norm_name(v) for v in _name_variants(name)}
 
-        def find_exact(menu_loc):
-            if not menu_loc or menu_loc.count() == 0:
-                return -1
-            # projdi jen prvních pár (rychlost)
-            n = min(menu_loc.count(), 12)
+        try:
+            page.wait_for_selector("ul.ui-autocomplete:visible", timeout=FAST_MENU_MS)
+            menu = page.locator("ul.ui-autocomplete:visible li")
+            n = min(menu.count(), 15)
+
+            pick = -1
             for i in range(n):
-                raw = (menu_loc.nth(i).inner_text() or "").strip()
+                raw = (menu.nth(i).inner_text() or "").strip()
                 base = _strip_menu_text(raw)
                 if _norm_name(base) in want_norms:
-                    return i
-            return -1
+                    pick = i
+                    break
 
-        idx = find_exact(menu)
-
-        # 1 rychlý pokus s opačným pořadím, pokud zbývá čas
-        if idx < 0 and left_budget() > 0.4:
-            variants = _name_variants(name)
-            if len(variants) == 2:
-                ac_input.fill("")
-                ac_input.type(variants[1], delay=0)
-                page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
-                try:
-                    page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
-                    menu = page.locator("ul.ui-autocomplete:visible li")
-                except Exception:
-                    menu = None
-                want_norms = {_norm_name(v) for v in _name_variants(variants[1])}
-                idx = find_exact(menu)
-
-        if idx >= 0:
-            menu.nth(idx).click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
-            # malý check labelu (bez čekání)
-            shown = (target.inner_text() or "").strip()
-            if shown and _norm_name(shown) in want_norms:
-                log(f"  ✓ {name} → {selector} (exact)")
+            if pick >= 0:
+                menu.nth(pick).click(timeout=FAST_CLICK_MS)
             else:
-                log(f"  ~ {name} → {selector} vybráno, ale zobrazeno '{shown}'")
+                # nouzově „něco“ vybrat, ať se buňka probere
+                page.keyboard.press("ArrowDown")
+                page.keyboard.press("Enter")
+        except Exception:
+            # žádné menu – zkus ArrowDown+Enter
+            page.keyboard.press("ArrowDown")
+            page.keyboard.press("Enter")
+
+        # 4) info po akci
+        shown = (target.inner_text() or "").strip()
+        if shown and shown != "----":
+            if any(_norm_name(shown) == _norm_name(v) for v in _name_variants(name)):
+                log(f"  ✓ {name} → {cell_sel or selector} (exact)")
+            else:
+                log(f"  ~ {name} → {cell_sel or selector} vybráno, ale zobrazeno '{shown}'")
         else:
-            # rychle ukončit – žádné padání na první položku!
-            page.keyboard.press("Escape")
-            log(f"  ⚠ {name} → bez přesné shody (do 2s), ponecháno k ruční kontrole")
+            log(f"  ⚠ {name} → žádná změna v buňce (stále '{shown or ''}')")
+            _diag_dump_cell(page, target, f"nochange_{_norm_name(name)}", log)
 
     except Exception as e:
-        log(f"  ✗ {name} → {selector} failed: {repr(e)}")
-
+        log(f"  ✗ {name} → klik/focus selhal: {e!r}")
 
 
 
