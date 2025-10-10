@@ -1307,18 +1307,21 @@ def main():
 
             # 4) login
             log("Navigating to login…")
-            page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
-                      wait_until="domcontentloaded")
+            page.goto("https://registr.ping-pong.cz/htm/auth/login.php", wait_until="domcontentloaded", timeout=20000)
             page.fill("input[name='login']", user_login)
             page.fill("input[name='heslo']",  user_pwd)
-            page.locator("[name='send']").click()
-            page.wait_for_load_state("domcontentloaded")
+            
+            btn_login = page.locator("[name='send']")
+            # Login vyvolává navigaci → dej mu delší timeout jen tady
+            with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                btn_login.click(timeout=3000)
             log("Logged in.")
 
             # 5) stránka družstva
             team_url = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
             log("Open team page:", team_url)
-            page.goto(team_url, wait_until="domcontentloaded")
+            page.goto(team_url, wait_until="domcontentloaded", timeout=20000)
+
 
             # 6) najdi vstup do formuláře (vložit/upravit)
             log("Hledám odkaz 'vložit/upravit zápis'…")
@@ -1382,11 +1385,12 @@ def main():
                 try:
                     btn = page.locator("input[name='odeslat']")
                     if btn.count():
-                        btn.click(timeout=1500)
-                        page.wait_for_load_state("domcontentloaded")
+                        # tento klik také naviguje → expect_navigation s delším timeoutem
+                        with page.expect_navigation(wait_until="domcontentloaded", timeout=15000):
+                            btn.click(timeout=3000)
                         log("Formulář odeslán")
-
-                        # jestli server stále křičí na čas, krátce přenastav a zkus znovu
+            
+                        # kontrola chybové hlášky k času (už na nové stránce)
                         if page.locator(".exception:has-text('není vyplněn začátek utkání')").count():
                             log(f"Pokus {attempt+1}: Server stále hlásí chybu s časem")
                             if attempt < max_attempts - 1:
@@ -1399,6 +1403,7 @@ def main():
                     log(f"Pokus {attempt+1} selhal:", repr(e))
                     if attempt == max_attempts - 1:
                         raise RuntimeError("Nepodařilo se odeslat formulář ani po několika pokusech")
+
 
             # 9) Čekej na online editor a vyplň
             try:
