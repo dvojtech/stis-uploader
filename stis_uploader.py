@@ -94,10 +94,34 @@ def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, o
                     log(f"  [leaders] '{cb_name}' zaškrtnuto")
             except Exception:
                 pass
+def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, only_from_club=True):
+    """
+    Vyplní 'Vedoucí družstev' klikem na položku v autocomplete menu.
+    Priorita shody:
+      1) přesná shoda CELÉHO textu (když předáš display text přesně jako v menu),
+      2) když ne, vybere první položku, jejíž text ZAČÍNÁ na zadané jméno (prefix match),
+         např. 'Dvořák Jiří' → 'Dvořák Jiří 1970 (TJ ...)'.
+    Po výběru provede blur (Tab) a ověří hidden ID (…vedouciid).
+    """
+    MENU_MS  = 1500
+    TYPE_DLY = 15
+    SLEEP_MS = 80
 
-    def _pick_exact(input_sel: str, hidden_sel: str, full_display_text: str) -> bool:
-        full_display_text = (full_display_text or "").strip()
-        if not full_display_text:
+    def _ensure_only_from_club():
+        if not only_from_club:
+            return
+        for cb_name in ("chbklub", "chbklub2"):
+            try:
+                cb = page.locator(f"input[name='{cb_name}']").first
+                if cb.count() and not cb.is_checked():
+                    cb.check(timeout=600)
+                    log(f"  [leaders] '{cb_name}' zaškrtnuto")
+            except Exception:
+                pass
+
+    def _pick_click(input_sel: str, hidden_sel: str, display_hint: str) -> bool:
+        hint = (display_hint or "").strip()
+        if not hint:
             log(f"  [leaders] požadovaný text je prázdný pro {input_sel}")
             return False
 
@@ -107,18 +131,18 @@ def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, o
             log(f"  [leaders] input {input_sel} nenalezen")
             return False
 
-        # vynuluj hidden před volbou (ať víme, že se po výběru nastavilo)
+        # vynuluj hidden (ať víme, že se po výběru nastaví)
         try:
             if hid.count():
                 hid.evaluate("el => { el.value=''; }")
         except Exception:
             pass
 
-        # vyčištění + fokus + psaní
+        # napiš dotaz a otevři menu
         try: inp.fill("")
         except Exception: pass
         inp.focus()
-        page.keyboard.type(full_display_text, delay=TYPE_DLY)
+        page.keyboard.type(hint, delay=TYPE_DLY)
         try:
             inp.evaluate("""
                 el => {
@@ -129,7 +153,6 @@ def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, o
         except Exception:
             pass
 
-        # počkej na menu, případně explicitně vyvolej jQuery autocomplete
         menu_sel = "ul.ui-autocomplete:visible, .ui-autocomplete.ui-menu:visible"
         try:
             page.wait_for_selector(menu_sel, timeout=MENU_MS)
@@ -138,34 +161,34 @@ def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, o
                 inp.evaluate("el => { if (window.jQuery && jQuery.fn.autocomplete) jQuery(el).autocomplete('search', el.value||''); }")
                 page.wait_for_selector(menu_sel, timeout=MENU_MS)
             except Exception:
-                log(f"  [leaders] menu se neukázalo pro přesný text {full_display_text!r}")
+                log(f"  [leaders] menu se neukázalo pro {hint!r}")
                 return False
 
-        # načti položky a hledej PŘESNOU shodu CELÉHO textu (po ořezu mezer)
         menu = page.locator(menu_sel).first.locator("li")
         cnt = menu.count()
         if not cnt:
-            log(f"  [leaders] prázdné menu pro {full_display_text!r}")
+            log(f"  [leaders] prázdné menu pro {hint!r}")
             return False
 
-        # DIAG: ukaž pár položek (pro případ, že se text v menu liší)
-        show = min(cnt, 12)
-        items = [(i, (menu.nth(i).inner_text() or "").strip()) for i in range(show)]
-        log("  [leaders] menu:", "; ".join([f"{i}:{t}" for i,t in items]))
+        # načti všechny texty položek najednou
+        items = [ (i, (menu.nth(i).inner_text() or "").strip()) for i in range(cnt) ]
+        log("  [leaders] menu:", "; ".join([f"{i}:{t}" for i,t in items[:10]]))
 
-        pick = -1
-        wanted = (full_display_text or "").strip()
-        for i in range(cnt):
-            txt = (menu.nth(i).inner_text() or "").strip()
-            if txt == wanted:
-                pick = i
-                break
+        # 1) přesná shoda celého textu
+        pick = next((i for i,t in items if t == hint), -1)
+
+        # 2) prefix shoda (case/diakritika ignorována): „začíná na zadané jméno“
+        if pick < 0:
+            hint_norm = _norm_name(hint)
+            for i,t in items:
+                if _norm_name(t).startswith(hint_norm):
+                    pick = i; break
 
         if pick < 0:
-            log(f"  [leaders] PŘESNÁ shoda nenaalezena: {wanted!r}  → nevybráno")
+            log(f"  [leaders] nenašla se shoda pro {hint!r} → nevybráno")
             return False
 
-        # klik na přesnou položku + blur (commit)
+        # klik na vybranou li + blur
         try:
             menu.nth(pick).click(timeout=800)
         except Exception:
@@ -173,7 +196,7 @@ def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, o
         page.keyboard.press("Tab")
         page.wait_for_timeout(SLEEP_MS)
 
-        # ověř skryté ID i viditelný text
+        # kontrola hidden ID i viditelného textu
         try:
             hid_val = (hid.get_attribute("value") or "").strip() if hid.count() else ""
         except Exception:
@@ -183,31 +206,29 @@ def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, o
         except Exception:
             vis_val = (inp.evaluate("el => el.value") or "").strip()
 
-        ok = bool(hid_val) and (vis_val.strip() == wanted)
-        log(f"  [leaders] '{wanted}' → {'OK' if ok else 'NEULOŽENO'} (hidden={hid_val or '∅'}, visible={vis_val or '∅'})")
+        ok = bool(hid_val) and bool(vis_val)
+        log(f"  [leaders] '{hint}' → {'OK' if ok else 'NEULOŽENO'} (hidden={hid_val or '∅'}, visible={vis_val or '∅'})")
         return ok
 
     _ensure_only_from_club()
-    ok_home = _pick_exact("input[name='id_domaci_vedoucitext']",
+    ok_home = _pick_click("input[name='id_domaci_vedoucitext']",
                           "input[name='id_domaci_vedouciid']",
                           home_name_text)
-    ok_away = _pick_exact("input[name='id_hoste_vedoucitext']",
+    ok_away = _pick_click("input[name='id_hoste_vedoucitext']",
                           "input[name='id_hoste_vedouciid']",
                           away_name_text)
     return ok_home and ok_away
 
 
-
 def fill_playroom(page, wanted_text: str, log):
     """
-    Vybere Hrací místnost na úvodním formuláři.
-    Cílí přímo na:
-      - input[name='zapis_herna']
-      - select[name='zapis_id_herna']
-    Pokud 'wanted_text' nesedí přesně na žádnou option, vybere první smysluplnou.
+    Vybere Hrací místnost na úvodním formuláři „klikově“:
+      - klikne na <select name='zapis_id_herna'>
+      - vybere <option> (přesný text, jinak první smysluplnou)
+      - vystřelí 'change', udělá blur a ověří, že se propsal i text input
     """
-    CLICK_MS = 400
-    SLEEP_MS = 60
+    CLICK_MS = 600
+    SLEEP_MS = 80
     wanted_text = (wanted_text or "").strip()
 
     sel = page.locator("select[name='zapis_id_herna']").first
@@ -217,29 +238,35 @@ def fill_playroom(page, wanted_text: str, log):
         return False
 
     try:
-        try: sel.scroll_into_view_if_needed(timeout=CLICK_MS)
-        except Exception: pass
+        try:
+            sel.scroll_into_view_if_needed(timeout=CLICK_MS)
+        except Exception:
+            pass
 
-        # vyčti všechny možnosti najednou
-        options = sel.evaluate("el => Array.from(el.options).map(o => ({v:o.value, t:(o.textContent||'').trim()}))") or []
+        # Otevři dropdown (nativně ne vždy zobrazí overlay, ale klik je „bezpečný“)
+        sel.click(timeout=CLICK_MS, force=True)
+
+        # Načti všechny možnosti jedním krokem
+        options = sel.evaluate(
+            "el => Array.from(el.options).map(o => ({v:o.value, t:(o.textContent||'').trim()}))"
+        ) or []
         if not options:
             log("  [playroom] select nemá položky")
             return False
 
-        # přesná shoda (normalizovaně, bez šumu v závorkách apod.)
+        # Najdi přesnou shodu textu, jinak vezmi první „smysluplnou“
         pick_value = None
         if wanted_text:
             want_norm = _norm_name(_strip_menu_text(wanted_text))
             for o in options:
-                if _norm_name(_strip_menu_text(o.get("t",""))) == want_norm:
-                    pick_value = o.get("v"); break
+                if _norm_name(_strip_menu_text(o.get('t',''))) == want_norm:
+                    pick_value = o.get('v'); break
 
-        # fallback: první smysluplná (ne placeholder)
         if not pick_value:
             for o in options:
                 v = (o.get("v") or "").strip()
                 t = (o.get("t") or "").strip()
-                if not v:                       # prázdné value přeskočit
+                if not v:
                     continue
                 if t.startswith("- zvolte") or t.startswith("- vyberte"):
                     continue
@@ -249,35 +276,38 @@ def fill_playroom(page, wanted_text: str, log):
             log("  [playroom] žádná vhodná položka k výběru")
             return False
 
-        # vyber + vystřel change (onchange updatuje text input)
+        # Samotný výběr + 'change'
         try:
-            sel.select_option(value=pick_value, timeout=500)
+            sel.select_option(value=pick_value, timeout=800)
         except Exception:
-            sel.evaluate("(el, v) => { el.value = v; el.dispatchEvent(new Event('change',{bubbles:true})) }", pick_value)
+            sel.evaluate("(el, v) => { el.value=v; el.dispatchEvent(new Event('change',{bubbles:true})) }", pick_value)
         else:
             try:
                 sel.evaluate("el => el.dispatchEvent(new Event('change',{bubbles:true}))")
             except Exception:
                 pass
 
+        # blur (některé bindingy commitují až na blur)
+        page.keyboard.press("Tab")
         page.wait_for_timeout(SLEEP_MS)
 
-        chosen = sel.evaluate("el => el.selectedOptions?.[0]?.textContent || el.options[el.selectedIndex]?.textContent || ''") or ""
-        chosen = chosen.strip()
-
-        # pro jistotu doplň text input i manuálně (kdyby onchange nezafungoval)
+        # Kontrola a případné doplnění do text inputu
+        chosen = sel.evaluate(
+            "el => (el.selectedOptions?.[0]?.textContent || el.options[el.selectedIndex]?.textContent || '').trim()"
+        ) or ""
         if chosen:
             try:
                 txt.fill(chosen)
             except Exception:
-                txt.evaluate("(el, t) => el.value = t", chosen)
+                txt.evaluate("(el, t) => el.value=t", chosen)
 
         log(f"  [playroom] vybráno: '{chosen}'")
-        return True
+        return bool(chosen)
 
     except Exception as e:
         log(f"  [playroom] selhání: {e!r}")
         return False
+
 
 
 def prepare_playwright_browsers(logger):
