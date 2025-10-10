@@ -222,11 +222,12 @@ def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, o
 
 def fill_playroom(page, wanted_text: str, log):
     """
-    Vybere Hrací místnost robustně:
-      - najde správný <select> (případně více kandidátů v sekci 'Hrací místnost'),
-      - přesná shoda podle textu option (normalizovaně),
-      - když není shoda: první reálná volba (index > 0, ne 'zvolte/vyberte…', value != '', '0', '-1'),
-      - nastaví případně i druhý <select> a propíše text input 'zapis_herna'.
+    Hrací místnost – robustně a „klikově“ přes JS:
+      - najde <select name='zapis_id_herna'> (případně nejlepší kandidát),
+      - zjistí seznam option (text + value),
+      - vybere buď přesnou shodu podle textu, nebo první reálnou položku (index>0),
+      - NÁSILNĚ nastaví selectedIndex a vystřelí input/change/click,
+      - propíše vybraný text do input[name='zapis_herna'] a vystřelí jeho input/change.
     """
     CLICK_MS = 600
     SLEEP_MS = 80
@@ -236,174 +237,97 @@ def fill_playroom(page, wanted_text: str, log):
         s = (t or "").strip().lower()
         return (s.startswith("- zvolte") or s.startswith("- vyberte") or s == "-" or "hrací místnost" in s)
 
-    def _is_bad_value(v: str) -> bool:
-        s = (v or "").strip().lower()
-        return s in ("", "0", "-1", "null", "undefined")
+    # 1) pokus o „oficiální“ select
+    sel = page.locator("select[name='zapis_id_herna']").first
+    if not sel.count():
+        # fallbacky poblíž textu 'Hrací místnost'
+        sel = page.locator("xpath=//*[contains(normalize-space(.),'Hrací místnost')]/following::select[1]").first
+    if not sel.count():
+        # nouzově první select, který nevypadá jako hodiny/minuty
+        for i in range(min(page.locator("select").count(), 10)):
+            cand = page.locator("select").nth(i)
+            nm = (cand.get_attribute("name") or "").lower()
+            if "hodin" in nm or "minut" in nm:
+                continue
+            sel = cand
+            break
 
-    # 1) najdi kandidáty <select>
-    candidates = []
-
-    # primárně ofiko jméno
-    sel_named = page.locator("select[name='zapis_id_herna']")
-    if sel_named.count():
-        candidates.append(sel_named.first)
-
-    # vše, co následuje za textem "Hrací místnost"
-    sel_after_label = page.locator("xpath=//*[contains(normalize-space(.),'Hrací místnost')]/following::select")
-    for i in range(min(sel_after_label.count(), 3)):
-        candidates.append(sel_after_label.nth(i))
-
-    # fallback: všechny selecty, které nejsou hodinové/minutové
-    all_selects = page.locator("select")
-    for i in range(min(all_selects.count(), 10)):
-        s = all_selects.nth(i)
-        try:
-            nm = (s.get_attribute("name") or "").lower()
-        except Exception:
-            nm = ""
-        if "hodin" in nm or "minut" in nm:
-            continue
-        candidates.append(s)
-
-    # odfiltruj duplicity podle handle
-    uniq = []
-    seen = set()
-    for s in candidates:
-        try:
-            h = s.evaluate("el => el")  # unikátní handle (jen kvůli idempotenci)
-        except Exception:
-            h = None
-        if h and id(s) not in seen:
-            uniq.append(s)
-            seen.add(id(s))
-
-    if not uniq:
+    if not sel.count():
         log("  [playroom] <select> pro 'Hrací místnost' nenalezen")
         return False
 
-    # 2) vyber ten, který má nejvíc smysluplných položek
-    def _score_select(sel):
-        try:
-            opts = sel.evaluate("el => Array.from(el.options).map(o => ({v:o.value, t:(o.textContent||'').trim()}))") or []
-        except Exception:
-            return (0, [])
-        # smysluplné = text neplaceholder NEBO index > 0
-        good = [o for idx, o in enumerate(opts) if idx > 0 or not _is_placeholder_text(o.get("t",""))]
-        return (len(good), opts)
-
-    best_sel, best_opts = None, []
-    best_score = -1
-    for s in uniq:
-        sc, ops = _score_select(s)
-        if sc > best_score:
-            best_score, best_sel, best_opts = sc, s, ops
-
-    if not best_sel or not best_opts:
-        log("  [playroom] žádný kandidát nemá použitelné položky")
+    # 2) načti seznam možností
+    options = sel.evaluate("el => Array.from(el.options).map((o,i) => ({i, v:o.value, t:(o.textContent||'').trim()}))") or []
+    if not options:
+        log("  [playroom] select nemá položky")
         return False
 
-    sel = best_sel
-    options = best_opts
-
-    # malý klik (některá UI až po něm vynutí bindingy)
-    try:
-        sel.scroll_into_view_if_needed(timeout=CLICK_MS)
-    except Exception:
-        pass
-    try:
-        sel.click(timeout=CLICK_MS, force=True)
-    except Exception:
-        pass
-
-    # 3) vyber hodnotu
-    pick_index = -1
-    pick_value = None
-
-    # přesná shoda (normalizovaně)
+    # 3) vyber index – nejprve přesná shoda podle TEXTU, potom první reálná (index>0, ne placeholder)
+    pick_idx = -1
     if wanted_text:
         want_norm = _norm_name(_strip_menu_text(wanted_text))
-        for i, o in enumerate(options):
+        for o in options:
             if _norm_name(_strip_menu_text(o.get("t",""))) == want_norm:
-                pick_index = i
-                pick_value = o.get("v"); break
+                pick_idx = int(o["i"]); break
 
-    # fallback: první reálná položka (index > 0 + text není placeholder + value není špatná)
-    if pick_index < 0:
-        for i, o in enumerate(options):
-            t = (o.get("t") or "").strip()
-            v = (o.get("v") or "").strip()
-            if i == 0:           # přeskoč 0
+    if pick_idx < 0:
+        for o in options:
+            i = int(o["i"]); t = o.get("t","")
+            if i == 0:            # přeskoč 0
                 continue
             if _is_placeholder_text(t):
                 continue
-            if _is_bad_value(v):
-                continue
-            pick_index = i
-            pick_value = v
-            break
+            pick_idx = i; break
 
-    # ještě nouzový fallback: když fakt nic, a jsou min. 2 položky, vezmi index 1
-    if pick_index < 0 and len(options) > 1:
-        pick_index = 1
-        pick_value = options[1].get("v")
+    # poslední záchrana – když aspoň 2 položky, ber index 1
+    if pick_idx < 0 and len(options) > 1:
+        pick_idx = 1
 
-    if pick_index < 0 or _is_bad_value(pick_value):
+    if pick_idx < 0:
         log("  [playroom] žádná vhodná položka k výběru (po všech pokusech)")
-        # vypiš pro diagnostiku prvních pár options
-        first = "; ".join([f"{i}:{(o.get('t') or '').strip()}" for i, o in enumerate(options[:6])])
-        log("  [playroom] options:", first)
+        log("  [playroom] options:", "; ".join([f"{o['i']}:{o['t']}" for o in options[:6]]))
         return False
 
+    # 4) „klikově“ přes JS: nastav selectedIndex, vystřel input/change/click
     try:
-        # preferuj select_option s krátkým timeoutem
-        try:
-            sel.select_option(value=str(pick_value), timeout=800)
-        except Exception:
-            # nouzově nastav index + change
-            sel.evaluate("(el, idx) => { el.selectedIndex = idx; el.dispatchEvent(new Event('change',{bubbles:true})); }", pick_index)
-        else:
-            # i po select_option vystřel change (někdy až to spustí kopírování do text inputu)
-            try:
-                sel.evaluate("el => el.dispatchEvent(new Event('change',{bubbles:true}))")
-            except Exception:
-                pass
+        try: sel.scroll_into_view_if_needed(timeout=CLICK_MS)
+        except Exception: pass
+        try: sel.click(timeout=CLICK_MS, force=True)   # nevadí, když nic „nevyskočí“
+        except Exception: pass
 
-        # blur/Tab – některé bindingy se commitují až na blur
-        page.keyboard.press("Tab")
+        sel.evaluate(
+            """
+            (el, idx) => {
+              // nastav vybraný index
+              el.selectedIndex = idx;
+
+              // vystřel události, na které UI může poslouchat
+              el.dispatchEvent(new Event('input',  {bubbles:true}));
+              el.dispatchEvent(new Event('change', {bubbles:true}));
+              el.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+
+              // propsat text do textového pole 'zapis_herna'
+              const opt = el.options[el.selectedIndex];
+              const txt = document.querySelector("input[name='zapis_herna']");
+              if (opt && txt) {
+                const label = (opt.textContent || '').trim();
+                txt.value = label;
+                txt.dispatchEvent(new Event('input',  {bubbles:true}));
+                txt.dispatchEvent(new Event('change', {bubbles:true}));
+              }
+            }
+            """,
+            pick_idx
+        )
+
         page.wait_for_timeout(SLEEP_MS)
 
-        # pokud jsou na stránce 2 selecty pro hernu, sjednoť oba
-        try:
-            same_selects = page.locator("xpath=//*[contains(normalize-space(.),'Hrací místnost')]/following::select[position()<=2]")
-            for i in range(min(same_selects.count(), 2)):
-                other = same_selects.nth(i)
-                if other.count() and other.element_handle() != sel.element_handle():
-                    try:
-                        other.select_option(value=str(pick_value), timeout=500)
-                    except Exception:
-                        other.evaluate("(el, v) => { el.value=v; el.dispatchEvent(new Event('change',{bubbles:true})); }", str(pick_value))
-        except Exception:
-            pass
-
-        # přečti vybraný text
-        chosen = sel.evaluate(
-            "el => (el.selectedOptions?.[0]?.textContent || el.options[el.selectedIndex]?.textContent || '').trim()"
-        ) or ""
-
-        # 4) přepiš i text input (kdyby onchange nekopíroval)
-        txt = page.locator("input[name='zapis_herna']").first
-        if txt.count() and chosen:
-            try:
-                txt.fill(chosen)
-            except Exception:
-                txt.evaluate("(el, t) => el.value=t", chosen)
-
-        # 5) finální kontrola – nesmí to být placeholder
+        # 5) ověř – přečti skutečně vybraný text a zkontroluj, že to není placeholder
+        chosen = sel.evaluate("el => (el.selectedOptions?.[0]?.textContent || el.options[el.selectedIndex]?.textContent || '').trim()") or ""
+        log(f"  [playroom] vybráno: index={pick_idx}, text='{chosen}'")
         if _is_placeholder_text(chosen):
-            log(f"  [playroom] vybrán placeholder '{chosen}' → FAIL")
+            log("  [playroom] FAIL: vybrán placeholder")
             return False
-
-        log(f"  [playroom] vybráno: '{chosen}' (index {pick_index})")
         return True
 
     except Exception as e:
