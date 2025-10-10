@@ -399,101 +399,142 @@ def map_wo(s):
     if t.upper() in ("WO 0:3", "WO 0:3", "WO0:3"):
         return "-101"
     return t
-def read_zdroj_data(xlsx_path):
-    """Načte DVĚ čtyřhry a singly z listu 'zdroj' – podle výše uvedených konstant."""
-    from openpyxl import load_workbook
-    
-    wb = load_workbook(xlsx_path, data_only=True)
-    if ZDROJ_SHEET not in wb.sheetnames:
-        # Debug: vypsat dostupné listy
-        available = ", ".join(wb.sheetnames)
-        raise RuntimeError(f"V sešitu chybí list '{ZDROJ_SHEET}'. Dostupné: {available}")
-    
-    sh = wb[ZDROJ_SHEET]
 
-    def cell(r, c):
-        val = sh.cell(r, c).value
-        return str(val or "").strip()
+def fill_online_from_zdroj(page, data, log, xlsx_path=None):
+    """
+    Vyplní online formulář STIS podle skutečné struktury DOM.
 
-    def debug_cell(r, c, desc=""):
-        val = sh.cell(r, c).value
-        print(f"DEBUG {desc}: R{r}C{c} = {repr(val)} -> '{str(val or '').strip()}'")
-        return str(val or "").strip()
-
-    print(f"DEBUG: Načítám data z listu '{ZDROJ_SHEET}'")
-    print(f"DEBUG: Max row: {sh.max_row}, Max col: {sh.max_column}")
-
-    # ČTYŘHRY - DVĚ čtyřhry
-    doubles = []
-    
-    # ČTYŘHRA #1 – jména (D2,D3,E2,E3) a sety (I3..M3)
-    print(f"DEBUG: === Načítám ČTYŘHRU #1 ===")
-    double1 = {
-        "home1": debug_cell(2, 4, "double1 home1 D2"),
-        "home2": debug_cell(3, 4, "double1 home2 D3"), 
-        "away1": debug_cell(2, 5, "double1 away1 E2"),
-        "away2": debug_cell(3, 5, "double1 away2 E3"),
-        "sets":  []
+    Očekávaný tvar `data` (z read_zdroj_data):
+    {
+      "doubles": [
+        {"home1": "...", "home2": "...", "away1": "...", "away2": "...", "sets": ["11:7","..."]},  # c0
+        {"home1": "...", "home2": "...", "away1": "...", "away2": "...", "sets": [...]},           # c1
+      ],
+      "singles": [
+        {"idx": 2,  "home": "...", "away": "...", "sets": [...]},  # → d0
+        ...
+        {"idx": 17, "home": "...", "away": "...", "sets": [...]},  # → d15
+      ]
     }
-    
-    # Sety čtyřhry #1 (I3..M3)
-    for i in range(5):
-        col = 9 + i  # I=9, J=10, K=11, L=12, M=13
-        val = debug_cell(3, col, f"double1 set{i+1}")
-        double1["sets"].append(map_wo(val))
-    
-    print(f"DEBUG: Čtyřhra #1 načtena: {double1}")
-    doubles.append(double1)
-    
-    # ČTYŘHRA #2 – jména (D4,D5,E4,E5) a sety (I5..M5)
-    print(f"DEBUG: === Načítám ČTYŘHRU #2 ===")
-    double2 = {
-        "home1": debug_cell(4, 4, "double2 home1 D4"),
-        "home2": debug_cell(5, 4, "double2 home2 D5"), 
-        "away1": debug_cell(4, 5, "double2 away1 E4"),
-        "away2": debug_cell(5, 5, "double2 away2 E5"),
-        "sets":  []
-    }
-    
-    # Sety čtyřhry #2 (I5..M5)
-    for i in range(5):
-        col = 9 + i  # I=9, J=10, K=11, L=12, M=13
-        val = debug_cell(5, col, f"double2 set{i+1}")
-        double2["sets"].append(map_wo(val))
-    
-    print(f"DEBUG: Čtyřhra #2 načtena: {double2}")
-    doubles.append(double2)
+    """
+    doubles = (data or {}).get("doubles", []) or []
+    singles = (data or {}).get("singles", []) or []
 
-    # SINGLY – indexy 2..(2+SINGLES_COUNT-1) → řádky od ZDROJ_FIRST_SINGLE_ROW
-    print(f"DEBUG: === Načítám SINGLY ===")
-    singles = []
-    row = ZDROJ_FIRST_SINGLE_ROW
-    
-    for idx in range(2, 2 + SINGLES_COUNT):
-        print(f"DEBUG: Načítám singl #{idx} z řádku {row}")
-        
-        home = debug_cell(row, 4, f"singl{idx} home")
-        away = debug_cell(row, 5, f"singl{idx} away") 
-        sets = []
-        
-        for i in range(5):
-            col = 9 + i
-            val = debug_cell(row, col, f"singl{idx} set{i+1}")
-            sets.append(map_wo(val))
-            
-        single = {"idx": idx, "home": home, "away": away, "sets": sets}
-        singles.append(single)
-        print(f"DEBUG: Singl {idx}: {single}")
-        row += 1
+    log(
+        "fill_online_from_zdroj: start – singles:",
+        len(singles),
+        "doubles:",
+        len(doubles)
+    )
 
-    result = {"doubles": doubles, "singles": singles}
-    print(f"DEBUG: === SOUHRN ===")
-    print(f"DEBUG: Celkem načteno čtyřher: {len(doubles)}")
-    for i, dbl in enumerate(doubles, 1):
-        print(f"DEBUG:   Čtyřhra #{i}: {bool(dbl['home1'] or dbl['home2'])} (má data)")
-    print(f"DEBUG: Celkem načteno singlů: {len([s for s in singles if s['home'] or s['away']])} (s daty)")
-    
-    return result
+    # --- čekej na připravenost online formuláře ---
+    try:
+        wait_online_ready(page, log)
+    except Exception:
+        log("Inputs se neobjevily – dělám dump DOMu.")
+        if xlsx_path:
+            try:
+                _dom_dump(page, xlsx_path, log)
+            except Exception as e_dump:
+                log(f"DOM dump selhal: {e_dump!r}")
+        raise
+
+    # --- CSS hack: odhrň překryv kartičky + ujisti viditelnost labelu ---
+    page.add_style_tag(content="""
+      .button-karta, .button-karta * { pointer-events: none !important; }
+      .player-name { visibility: visible !important; opacity: 1 !important; }
+    """)
+    log("CSS hack pro .button-karta a .player-name aplikován.")
+
+    # ==========================
+    # ČTYŘHRA #1 (ID: c0)
+    # ==========================
+    if len(doubles) >= 1:
+        dbl = doubles[0]
+        log("Vyplňuji čtyřhru #1 (c0)")
+
+        if dbl.get("home1"):
+            log(f"[c0] home1 sel=#c0 .cell-player:first-child  name={dbl['home1']!r}")
+            _fill_player_by_click(page, "#c0 .cell-player:first-child", dbl["home1"], log)
+
+        if dbl.get("away1"):
+            log(f"[c0] away1 sel=#c0 .cell-player:last-child   name={dbl['away1']!r}")
+            _fill_player_by_click(page, "#c0 .cell-player:last-child",  dbl["away1"], log)
+
+        # druhý pár (sourozenec #c0)
+        if dbl.get("home2"):
+            log(f"[c0] home2 sel=#c0 + .cell-players .cell-player:first-child  name={dbl['home2']!r}")
+            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:first-child", dbl["home2"], log)
+
+        if dbl.get("away2"):
+            log(f"[c0] away2 sel=#c0 + .cell-players .cell-player:last-child   name={dbl['away2']!r}")
+            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:last-child",  dbl["away2"], log)
+
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 0, dbl["sets"], log)
+
+    # ==========================
+    # ČTYŘHRA #2 (ID: c1)
+    # ==========================
+    if len(doubles) >= 2:
+        dbl = doubles[1]
+        log("Vyplňuji čtyřhru #2 (c1)")
+
+        if dbl.get("home1"):
+            log(f"[c1] home1 sel=#c1 .cell-player:first-child  name={dbl['home1']!r}")
+            _fill_player_by_click(page, "#c1 .cell-player:first-child", dbl["home1"], log)
+
+        if dbl.get("away1"):
+            log(f"[c1] away1 sel=#c1 .cell-player:last-child   name={dbl['away1']!r}")
+            _fill_player_by_click(page, "#c1 .cell-player:last-child",  dbl["away1"], log)
+
+        # druhý pár (sourozenec #c1)
+        if dbl.get("home2"):
+            log(f"[c1] home2 sel=#c1 + .cell-players .cell-player:first-child  name={dbl['home2']!r}")
+            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:first-child", dbl["home2"], log)
+
+        if dbl.get("away2"):
+            log(f"[c1] away2 sel=#c1 + .cell-players .cell-player:last-child   name={dbl['away2']!r}")
+            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:last-child",  dbl["away2"], log)
+
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 1, dbl["sets"], log)
+
+    # ==========================
+    # SINGLY d0..d15 (Excel idx 2..17)
+    # ==========================
+    for match_data in singles:
+        excel_idx = int(match_data.get("idx", 0))  # 2..17
+        if excel_idx < 2 or excel_idx > 17:
+            continue
+
+        dom_idx   = excel_idx - 2              # 0..15 → #d{dom_idx}
+        event_idx = excel_idx                  # pro sety zůstává excelový index
+
+        log(f"Zpracovávám singl Excel#{excel_idx} → DOM d{dom_idx} → event #{event_idx}")
+
+        if match_data.get("home"):
+            log(f"[d{dom_idx}] home sel=#d{dom_idx} .cell-player:first-child  name={match_data['home']!r}")
+            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:first-child", match_data["home"], log)
+
+        if match_data.get("away"):
+            log(f"[d{dom_idx}] away sel=#d{dom_idx} .cell-player:last-child   name={match_data['away']!r}")
+            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:last-child",  match_data["away"], log)
+
+        if match_data.get("sets"):
+            _fill_sets_by_event_index(page, event_idx, match_data["sets"], log)
+
+    # ==========================
+    # Uložit změny
+    # ==========================
+    log("Klikám 'Uložit změny'…")
+    try:
+        page.locator("input[name='ulozit']").click(timeout=5000)
+        page.wait_for_timeout(1000)
+        log("Změny uloženy.")
+    except Exception as e:
+        log(f"Uložení selhalo: {e!r}")
+
 
 def read_zdroj_data(xlsx_path, log):
     """
