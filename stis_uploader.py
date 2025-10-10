@@ -73,65 +73,48 @@ def row_sets(sh, row: int, cols=("I","J","K","L","M")):
 def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_club=True):
     """
     Vyplní 'Vedoucí družstev' (Domácí/Hosté) na úvodním formuláři.
-    - Používá jQuery UI autocomplete: napíše dotaz, POČKÁ na menu, vybere exact shodu klikem.
-    - Volitelně zapne 'Jen z oddílu'.
-    - Po výběru udělá blur/tab a krátce čekne, že hodnota zůstala.
+    - Viditelné inputy:  id_domaci_vedoucitext / id_hoste_vedoucitext
+    - Skrytá ID:         id_domaci_vedouciid   / id_hoste_vedouciid
+    - Checkboxy 'Jen z oddílu': name='chbklub' a 'chbklub2'
     """
     MENU_MS  = 1500
     TYPE_DLY = 20
     SLEEP_MS = 80
 
-    def _by_label(label_text: str):
-        # Nejrobustnější je Playwright "get_by_label"
-        try:
-            return page.get_by_label(label_text, exact=True)
-        except Exception:
-            # fallback – najít label a první input za ním
-            lbl = page.locator(f"label:has-text('{label_text}')").first
-            if lbl.count():
-                return lbl.locator("xpath=following::input[1]")
-            return page.locator("input[aria-label='%s']" % label_text).first
-
     def _ensure_only_from_club():
         if not only_from_club:
             return
-        try:
-            # zkuste standardní label
-            cb = page.get_by_label("Jen z oddílu", exact=True)
-        except Exception:
-            # fallback – checkbox poblíž textu
-            cb = page.locator("text=Jen z oddílu").locator("xpath=preceding::input[@type='checkbox'][1]")
-        try:
-            if cb and cb.count():
-                cb.check(timeout=500)
-                log("  [leaders] 'Jen z oddílu' zaškrtnuto")
-        except Exception:
-            pass
+        for cb_name in ("chbklub", "chbklub2"):
+            try:
+                cb = page.locator(f"input[name='{cb_name}']").first
+                if cb.count() and not cb.is_checked():
+                    cb.check(timeout=600)
+                    log(f"  [leaders] '{cb_name}' zaškrtnuto")
+            except Exception:
+                pass
 
-    def _pick_from_autocomplete(input_loc, full_name: str) -> bool:
+    def _pick(input_sel: str, hidden_sel: str, full_name: str) -> bool:
         full_name = (full_name or "").strip()
-        if not full_name or not input_loc or not input_loc.count():
+        if not full_name:
+            return False
+
+        inp = page.locator(input_sel).first
+        if not inp.count():
+            log(f"  [leaders] input {input_sel} nenalezen")
             return False
 
         # vyčištění + fokus
-        try:
-            input_loc.fill("")
-        except Exception:
-            pass
-        try:
-            input_loc.focus()
-        except Exception:
-            pass
+        try: inp.fill("")
+        except Exception: pass
+        inp.focus()
 
-        # napiš dotaz (stačí příjmení, ale dáme celé jméno)
+        # napiš dotaz
         page.keyboard.type(full_name, delay=TYPE_DLY)
-
-        # vynutíme DOM události
         try:
-            input_loc.evaluate("""
+            inp.evaluate("""
                 el => {
-                    el.dispatchEvent(new Event('input', {bubbles:true}));
-                    el.dispatchEvent(new KeyboardEvent('keyup', {key:' ', bubbles:true}));
+                  el.dispatchEvent(new Event('input',{bubbles:true}));
+                  el.dispatchEvent(new KeyboardEvent('keyup',{key:' ',bubbles:true}));
                 }
             """)
         except Exception:
@@ -141,15 +124,13 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
         try:
             page.wait_for_selector(menu_sel, timeout=MENU_MS)
         except Exception:
-            # zkus explicitní jQuery search
             try:
-                input_loc.evaluate("""el => { if (window.jQuery && jQuery.fn.autocomplete) { jQuery(el).autocomplete('search', el.value || ''); } }""")
+                inp.evaluate("el => { if (window.jQuery && jQuery.fn.autocomplete) jQuery(el).autocomplete('search', el.value||''); }")
                 page.wait_for_selector(menu_sel, timeout=MENU_MS)
             except Exception:
                 log(f"  [leaders] menu se neukázalo pro {full_name!r}")
                 return False
 
-        # najdi přesnou shodu v li
         menu = page.locator(menu_sel).first.locator("li")
         cnt = menu.count()
         if not cnt:
@@ -161,27 +142,22 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
         n = min(cnt, 30)
         for i in range(n):
             raw = (menu.nth(i).inner_text() or "").strip()
-            base = _strip_menu_text(raw)
-            if _norm_name(base) in want:
-                pick = i
-                break
+            if _norm_name(_strip_menu_text(raw)) in want:
+                pick = i; break
 
-        # fallback: čisté příjmení
         if pick < 0 and " " in full_name:
+            # fallback: příjmení
             surname = full_name.split()[-1]
-            input_loc.fill("")
-            input_loc.focus()
-            page.keyboard.type(surname, delay=TYPE_DLY)
+            try: inp.fill("")
+            except Exception: pass
+            inp.focus(); page.keyboard.type(surname, delay=TYPE_DLY)
             try:
                 page.wait_for_selector(menu_sel, timeout=MENU_MS)
                 menu = page.locator(menu_sel).first.locator("li")
                 n = min(menu.count(), 30)
-                want = {_norm_name(v) for v in _name_variants(full_name)}
                 for i in range(n):
-                    base = _strip_menu_text(menu.nth(i).inner_text() or "")
-                    if _norm_name(base) in want:
-                        pick = i
-                        break
+                    if _norm_name(_strip_menu_text(menu.nth(i).inner_text() or "")) in want:
+                        pick = i; break
             except Exception:
                 pass
 
@@ -189,144 +165,119 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
             log(f"  [leaders] nenašla se přesná shoda pro {full_name!r}")
             return False
 
-        # klik na položku
+        # vybrat položku + blur (commit)
         try:
-            menu.nth(pick).click(timeout=500)
+            menu.nth(pick).click(timeout=800)
         except Exception:
-            # ultimate fallback: Enter
             page.keyboard.press("Enter")
-
-        # blur (potřebuje ho často hidden field/binding)
         page.keyboard.press("Tab")
         page.wait_for_timeout(SLEEP_MS)
 
-        # ověř, že v inputu zůstalo vybrané jméno
+        # ověř skryté ID i viditelný text – jen to garantuje uložení
         try:
-            val = input_loc.input_value(timeout=400)
+            hid_val = (page.locator(hidden_sel).first.get_attribute("value") or "").strip()
         except Exception:
-            val = (input_loc.evaluate("el => el.value") or "")
-        ok = bool(val) and _norm_name(val) in {_norm_name(v) for v in _name_variants(full_name)}
+            hid_val = ""
+        try:
+            vis_val = inp.input_value(timeout=300)
+        except Exception:
+            vis_val = (inp.evaluate("el => el.value") or "").strip()
+
+        ok = bool(hid_val) and bool(vis_val)
+        log(f"  [leaders] {full_name} → {'OK' if ok else 'NEULOŽENO'} (hidden={hid_val or '∅'}, visible={vis_val or '∅'})")
         return ok
 
-    # === vlastní vyplnění ===
     _ensure_only_from_club()
-
-    home_input  = _by_label("Domácí:")
-    away_input  = _by_label("Hosté:")
-
-    ok_home = _pick_from_autocomplete(home_input, home_name)
-    log(f"Vedoucí domácích: {home_name}  → {'OK' if ok_home else 'NEULOŽENO'}")
-
-    ok_away = _pick_from_autocomplete(away_input, away_name)
-    log(f"Vedoucí hostů: {away_name}     → {'OK' if ok_away else 'NEULOŽENO'}")
-
+    ok_home = _pick("input[name='id_domaci_vedoucitext']",
+                    "input[name='id_domaci_vedouciid']",
+                    home_name)
+    ok_away = _pick("input[name='id_hoste_vedoucitext']",
+                    "input[name='id_hoste_vedouciid']",
+                    away_name)
     return ok_home and ok_away
+
 
 def fill_playroom(page, wanted_text: str, log):
     """
-    Vybere 'Hrací místnost' v úvodním formuláři.
-    - Nejprve se pokusí o přesnou shodu podle textu <option>.
-    - Když nic, vybere první smysluplnou položku (ne placeholder).
-    Vrací True/False podle toho, zda se něco vybralo.
+    Vybere Hrací místnost na úvodním formuláři.
+    Cílí přímo na:
+      - input[name='zapis_herna']
+      - select[name='zapis_id_herna']
+    Pokud 'wanted_text' nesedí přesně na žádnou option, vybere první smysluplnou.
     """
     CLICK_MS = 400
     SLEEP_MS = 60
+    wanted_text = (wanted_text or "").strip()
 
-    # 1) najdi <select> dle labelu "Hrací místnost"
-    def _select_by_label(label_txt: str):
-        try:
-            # Playwright label matcher
-            return page.get_by_label(label_txt, exact=True)
-        except Exception:
-            pass
-        # fallback: najdi label a první select za ním
-        lbl = page.locator(f"label:has-text('{label_txt}')").first
-        if lbl.count():
-            sel = lbl.locator("xpath=following::select[1]")
-            if sel.count():
-                return sel.first
-        # poslední fallback – globální select poblíž textu
-        return page.locator("select").first
-
-    sel = _select_by_label("Hrací místnost")
-    if not sel or not sel.count():
-        log("  [playroom] <select> pro 'Hrací místnost' nenalezen")
+    sel = page.locator("select[name='zapis_id_herna']").first
+    txt = page.locator("input[name='zapis_herna']").first
+    if not sel.count() or not txt.count():
+        log("  [playroom] select nebo text input pro hernu nenalezen")
         return False
 
     try:
-        try:
-            sel.scroll_into_view_if_needed(timeout=CLICK_MS)
-        except Exception:
-            pass
+        try: sel.scroll_into_view_if_needed(timeout=CLICK_MS)
+        except Exception: pass
 
-        # 2) vyčti všechny options jedním krokem (rychlé)
-        options = sel.evaluate(
-            "el => Array.from(el.options).map(o => ({v:o.value, t:(o.textContent||'').trim()}))"
-        ) or []
-
+        # vyčti všechny možnosti najednou
+        options = sel.evaluate("el => Array.from(el.options).map(o => ({v:o.value, t:(o.textContent||'').trim()}))") or []
         if not options:
             log("  [playroom] select nemá položky")
             return False
 
-        # 3) najdi přesnou shodu (normalizovaně, bez šumu typu závorek)
-        wanted_norms = set()
-        if wanted_text:
-            wanted_norms = {_norm_name(_strip_menu_text(wanted_text))}
-
+        # přesná shoda (normalizovaně, bez šumu v závorkách apod.)
         pick_value = None
-
-        if wanted_norms:
+        if wanted_text:
+            want_norm = _norm_name(_strip_menu_text(wanted_text))
             for o in options:
-                if _norm_name(_strip_menu_text(o.get("t", ""))) in wanted_norms:
-                    pick_value = o.get("v")
-                    break
+                if _norm_name(_strip_menu_text(o.get("t",""))) == want_norm:
+                    pick_value = o.get("v"); break
 
-        # 4) když nic – vem první „reálnou“ položku (ne placeholdery)
+        # fallback: první smysluplná (ne placeholder)
         if not pick_value:
             for o in options:
-                t = (o.get("t") or "").strip()
                 v = (o.get("v") or "").strip()
-                # přeskoč prázdné/placeholder
-                if not v:
+                t = (o.get("t") or "").strip()
+                if not v:                       # prázdné value přeskočit
                     continue
                 if t.startswith("- zvolte") or t.startswith("- vyberte"):
                     continue
-                pick_value = v
-                break
+                pick_value = v; break
 
         if not pick_value:
             log("  [playroom] žádná vhodná položka k výběru")
             return False
 
-        # 5) vyber + change
+        # vyber + vystřel change (onchange updatuje text input)
         try:
             sel.select_option(value=pick_value, timeout=500)
         except Exception:
-            # emergency: nastav přímo value a vyvolej change
-            sel.evaluate(
-                "(el, v) => { el.value = v; el.dispatchEvent(new Event('change', {bubbles:true})); }",
-                pick_value,
-            )
+            sel.evaluate("(el, v) => { el.value = v; el.dispatchEvent(new Event('change',{bubbles:true})) }", pick_value)
         else:
-            # jistota: i po select_option vystřel change
             try:
-                sel.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
+                sel.evaluate("el => el.dispatchEvent(new Event('change',{bubbles:true}))")
             except Exception:
                 pass
 
         page.wait_for_timeout(SLEEP_MS)
 
-        # 6) kontrola – přečti zobrazený text vybrané option
-        chosen = sel.evaluate(
-            "el => (el.selectedOptions && el.selectedOptions[0] ? el.selectedOptions[0].textContent : el.options[el.selectedIndex]?.textContent) || ''"
-        ) or ""
+        chosen = sel.evaluate("el => el.selectedOptions?.[0]?.textContent || el.options[el.selectedIndex]?.textContent || ''") or ""
         chosen = chosen.strip()
+
+        # pro jistotu doplň text input i manuálně (kdyby onchange nezafungoval)
+        if chosen:
+            try:
+                txt.fill(chosen)
+            except Exception:
+                txt.evaluate("(el, t) => el.value = t", chosen)
+
         log(f"  [playroom] vybráno: '{chosen}'")
         return True
 
     except Exception as e:
         log(f"  [playroom] selhání: {e!r}")
         return False
+
 
 def prepare_playwright_browsers(logger):
     """
@@ -1328,10 +1279,10 @@ def main():
             if not open_match_form(page, log):
                 raise RuntimeError("Na stránce družstva jsem nenašel odkaz do formuláře.")
 
-            # 7) vyplň úvodní údaje (herna / začátek / vedoucí)
             # 7.1) Hrací místnost (SELECT podle labelu „Hrací místnost“)
             wanted_room_text = (team.get("hraci_mistnost") or team.get("herna") or "").strip()
             ok_room = fill_playroom(page, wanted_text=wanted_room_text, log=log)
+
             log(f"Hrací místnost → {'OK' if ok_room else 'NEVYBRÁNA'}")
 
             # 7.2) Začátek utkání (hh:mm)
@@ -1374,7 +1325,7 @@ def main():
                 home_name=str(team.get("ved_dom") or "").strip(),
                 away_name=str(team.get("ved_host") or "").strip(),
                 log=log,
-                only_from_club=leaders_only_from_club,
+                only_from_club=True,
             )
             log(f"Vedoucí → {'OK' if ok_leaders else 'NEULOŽENO'}")
 
