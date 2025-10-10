@@ -161,39 +161,64 @@ def _diag_dump_cell(page, target, tag, log):
         log(f"  [diag] dump selhal: {e!r}")
         
 def _fill_player_by_click(page, selector, name, log):
-    """
-    RYCHLÁ verze (≤ ~2 s / jméno):
-      - Klikne na cílový .player-name
-      - Do aktivního inputu napíše jméno
-      - Počká kratce na menu a vybere POUZE přesnou shodu (bez diakritiky).
-      - Pokud přesná shoda není → žádný Enter/first! nechá prázdné a zaloguje ⚠
-    """
     name = (name or "").strip()
     if not name:
         return
 
-    start_ts = time.time()
-    def left_budget():
-        return max(0, MAX_PER_NAME_MS/1000.0 - (time.time() - start_ts))
+    # ⬇⬇⬇ NOVÉ: přemapování na kontejner buňky ⬇⬇⬇
+    # tvé selektory teď míří na ... .player-name; my klikneme o úroveň výš – na .cell-player
+    cell_sel = None
+    if " .cell-player:first-child " in selector or " .cell-player:last-child " in selector:
+        # čtyřhry – už tam buňku máš
+        cell_sel = selector.split(" .player", 1)[0]  # ořízni od " .player..." dál
+    elif "#d" in selector:
+        # singly – přemapuj #dX .player.domaci/host .player-name -> #dX .cell-player:first-child/last-child
+        # domácí:
+        if ".player.domaci " in selector:
+            cell_sel = selector.split(" .player", 1)[0].replace(".player.domaci", ".cell-player:first-child")
+        # host:
+        if ".player.host " in selector:
+            cell_sel = selector.split(" .player", 1)[0].replace(".player.host", ".cell-player:last-child")
+
+    # fallback: když by nic nevyšlo, klikneme aspoň na původní target
+    click_target = page.locator(cell_sel).first if cell_sel else page.locator(selector).first
 
     try:
-        target = page.locator(selector).first
-        if not target.count():
-            log(f"  Nenalezen element: {selector}")
-            return
-
-         # klik do cíle
+        # zajisti zorné pole
         try:
-            target.scroll_into_view_if_needed(timeout=FAST_CLICK_MS)
+            click_target.scroll_into_view_if_needed(timeout=800)
         except Exception:
             pass
-        try:
-            target.click(timeout=FAST_CLICK_MS)
-        except Exception:
-            target.click(timeout=FAST_CLICK_MS)
 
+        # ⬇⬇⬇ DŮLEŽITÉ: force=True obejde „not visible/actionable“ ⬇⬇⬇
+        click_target.click(timeout=800, force=True)
+        page.wait_for_timeout(150)
 
-        page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+        # input hledej nejdřív v té buňce, pak v #zapis, pak globálně
+        ac_input = click_target.locator(
+            "input.ui-autocomplete-input, input.ac_input, input[type='text']"
+        ).first
+        if not ac_input.count():
+            ac_input = page.locator(
+                "#zapis input.ui-autocomplete-input, #zapis input.ac_input, #zapis input[type='text']"
+            ).first
+        if not ac_input.count():
+            ac_input = page.locator(
+                "input.ui-autocomplete-input:visible, input.ac_input:visible, input[type='text']:visible"
+            ).first
+
+        if not ac_input.count():
+            log(f"  ✗ {name} → žádný input (selector {selector} → {cell_sel or selector})")
+            return
+
+        # ... a tady pokračuj tvým původním kódem (fill/type, čekání na menu, výběr, logování)
+        ac_input.fill("")
+        ac_input.type(name, delay=0)
+        # (zbytek tvé logiky beze změn)
+        # ...
+    except Exception as e:
+        log(f"  ✗ {name} → klik/focus selhal: {e!r}")
+
 
         # aktivní input (fokus)
         ac_input = page.locator(
@@ -458,8 +483,13 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         raise
     # HNED po wait_online_ready(page, log):
     page.add_style_tag(content="""
+      /* vypni hit-testing ikony karty, ať nepřekrývá klik */
       .button-karta, .button-karta * { pointer-events: none !important; }
+      /* pro jistotu: hráčovské labely ať jsou „viditelné“ */
+      .player-name { visibility: visible !important; opacity: 1 !important; }
     """)
+    log("CSS hack pro .button-karta a .player-name aplikován.")
+
 
 
     # ---- ČTYŘHRA #1 (ID: c0, event index 0) ----
@@ -473,14 +503,14 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         if dbl.get("home1"):
             _fill_player_by_click(
                 page, 
-                "#c0 .cell-player:first-child .player.domaci .player-name", 
+                "#c0 .cell-player:first-child", 
                 dbl["home1"], 
                 log
             )
         if dbl.get("away1"):
             _fill_player_by_click(
                 page, 
-                "#c0 .cell-player:last-child .player.host .player-name", 
+                #c0 .cell-player:last-child", 
                 dbl["away1"], 
                 log
             )
@@ -489,14 +519,14 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         if dbl.get("home2"):
             _fill_player_by_click(
                 page, 
-                "#c0 + .cell-players .cell-player:first-child .player.domaci.hrac2 .player-name", 
+                "#c0 + .cell-players .cell-player:first-child", 
                 dbl["home2"], 
                 log
             )
         if dbl.get("away2"):
             _fill_player_by_click(
                 page, 
-                "#c0 + .cell-players .cell-player:last-child .player.host.hrac2 .player-name", 
+                "#c0 + .cell-players .cell-player:last-child", 
                 dbl["away2"], 
                 log
             )
@@ -568,7 +598,7 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         if match_data.get("home"):
             _fill_player_by_click(
                 page, 
-                f"#d{dom_idx} .player.domaci .player-name", 
+                f"#d{idx} .cell-player:first-child", 
                 match_data["home"], 
                 log
             )
@@ -577,7 +607,7 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         if match_data.get("away"):
             _fill_player_by_click(
                 page, 
-                f"#d{dom_idx} .player.host .player-name", 
+                f"#d{idx} .cell-player:last-child", 
                 match_data["away"], 
                 log
             )
