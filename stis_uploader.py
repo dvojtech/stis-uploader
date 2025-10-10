@@ -1323,11 +1323,12 @@ def main():
             leaders_only_from_club = bool(team.get("leaders_only_from_club", True))
             ok_leaders = fill_leaders_on_start(
                 page,
-                home_name=str(team.get("ved_dom") or "").strip(),
-                away_name=str(team.get("ved_host") or "").strip(),
+                home_name_text=str(team.get("ved_dom_text") or team.get("ved_dom") or "").strip(),
+                away_name_text=str(team.get("ved_host_text") or team.get("ved_host") or "").strip(),
                 log=log,
                 only_from_club=True,
             )
+
             log(f"Vedoucí → {'OK' if ok_leaders else 'NEULOŽENO'}")
 
             # 8) Odeslat úvodní formulář (s malým retry na chybovou hlášku času)
