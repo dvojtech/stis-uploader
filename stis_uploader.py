@@ -12,7 +12,7 @@ from playwright.sync_api import TimeoutError as PwTimeout
 # --- rychlé timeouty (ms) pro výběr hráčů ---
 FAST_CLICK_MS   = 800
 FAST_FOCUS_MS   = 300
-FAST_MENU_MS    = 500   # čekání na zobrazení autocomplete
+FAST_MENU_MS    = 1500   # čekání na zobrazení autocomplete
 FAST_PAUSE_MS   = 80
 MAX_PER_NAME_MS = 1500  # tvrdý strop ~1.5 s na 1 jméno
 
@@ -106,104 +106,6 @@ def prepare_playwright_browsers(logger):
                f"zvaž build s přibalenými prohlížeči nebo jednorázovou instalaci.")
     return root
 
-def fill_online_from_zdroj(page, data, log, xlsx_path=None):
-    """
-    Vyplní online formulář STIS podle dat ze 'zdroj'.
-    Očekává data z read_zdroj_data(xlsx_path, log).
-    """
-    doubles = (data or {}).get("doubles", []) or []
-    singles = (data or {}).get("singles", []) or []
-
-    log("fill_online_from_zdroj: start – singles:", len(singles), "doubles:", len(doubles))
-
-    # 1) čekej na připravenost editoru
-    try:
-        wait_online_ready(page, log)
-    except Exception:
-        log("Inputs se neobjevily – dělám dump DOMu.")
-        if xlsx_path:
-            try: _dom_dump(page, xlsx_path, log)
-            except Exception as e_dump: log(f"DOM dump selhal: {e_dump!r}")
-        raise
-
-    # 2) CSS hack – odhrň překryv ikony karty a vynucená viditelnost labelů
-    page.add_style_tag(content="""
-      .button-karta, .button-karta * { pointer-events: none !important; }
-      .player-name { visibility: visible !important; opacity: 1 !important; }
-    """)
-    log("CSS hack pro .button-karta a .player-name aplikován.")
-
-    # ==== ČTYŘHRA #1 (c0) ====
-    if len(doubles) >= 1:
-        dbl = doubles[0]
-        log("Vyplňuji čtyřhru #1 (c0)")
-
-        if dbl.get("home1"):
-            log(f"[c0] home1 sel=#c0 .cell-player:first-child  name={dbl['home1']!r}")
-            _fill_player_by_click(page, "#c0 .cell-player:first-child", dbl["home1"], log)
-        if dbl.get("away1"):
-            log(f"[c0] away1 sel=#c0 .cell-player:last-child   name={dbl['away1']!r}")
-            _fill_player_by_click(page, "#c0 .cell-player:last-child",  dbl["away1"], log)
-
-        if dbl.get("home2"):
-            log(f"[c0] home2 sel=#c0 + .cell-players .cell-player:first-child  name={dbl['home2']!r}")
-            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:first-child", dbl["home2"], log)
-        if dbl.get("away2"):
-            log(f"[c0] away2 sel=#c0 + .cell-players .cell-player:last-child   name={dbl['away2']!r}")
-            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:last-child",  dbl["away2"], log)
-
-        if dbl.get("sets"):
-            _fill_sets_by_event_index(page, 0, dbl["sets"], log)
-
-    # ==== ČTYŘHRA #2 (c1) ====
-    if len(doubles) >= 2:
-        dbl = doubles[1]
-        log("Vyplňuji čtyřhru #2 (c1)")
-
-        if dbl.get("home1"):
-            log(f"[c1] home1 sel=#c1 .cell-player:first-child  name={dbl['home1']!r}")
-            _fill_player_by_click(page, "#c1 .cell-player:first-child", dbl["home1"], log)
-        if dbl.get("away1"):
-            log(f"[c1] away1 sel=#c1 .cell-player:last-child   name={dbl['away1']!r}")
-            _fill_player_by_click(page, "#c1 .cell-player:last-child",  dbl["away1"], log)
-
-        if dbl.get("home2"):
-            log(f"[c1] home2 sel=#c1 + .cell-players .cell-player:first-child  name={dbl['home2']!r}")
-            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:first-child", dbl["home2"], log)
-        if dbl.get("away2"):
-            log(f"[c1] away2 sel=#c1 + .cell-players .cell-player:last-child   name={dbl['away2']!r}")
-            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:last-child",  dbl["away2"], log)
-
-        if dbl.get("sets"):
-            _fill_sets_by_event_index(page, 1, dbl["sets"], log)
-
-    # ==== SINGLY d0..d15 (Excel idx 2..17) ====
-    for s in singles:
-        idx = int(s.get("idx", 0))  # 2..17
-        if not (2 <= idx <= 17):
-            continue
-        dom_idx = idx - 2           # 0..15 → #d{dom_idx}
-
-        log(f"Zpracovávám singl Excel#{idx} → DOM d{dom_idx} → event #{idx}")
-
-        if s.get("home"):
-            log(f"[d{dom_idx}] home sel=#d{dom_idx} .cell-player:first-child  name={s['home']!r}")
-            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:first-child", s["home"], log)
-        if s.get("away"):
-            log(f"[d{dom_idx}] away sel=#d{dom_idx} .cell-player:last-child   name={s['away']!r}")
-            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:last-child",  s["away"], log)
-
-        if s.get("sets"):
-            _fill_sets_by_event_index(page, idx, s["sets"], log)
-
-    # Ulož
-    log("Klikám 'Uložit změny'…")
-    try:
-        page.locator("input[name='ulozit']").click(timeout=5000)
-        page.wait_for_timeout(1000)
-        log("Změny uloženy.")
-    except Exception as e:
-        log(f"Uložení selhalo: {e!r}")
 
 def _norm_name(s: str) -> str:
     # normalizace jména: zmenší, odstraní diakritiku, srazí vícenásobné mezery
@@ -436,17 +338,6 @@ def cnt(page, css):  # krátká pomůcka do logu
         return page.locator(css).count()
     except Exception:
         return -1
-
-def map_wo(s):
-    """mapování WO značek na STIS kódy, jinak vrací čistý text/číslo"""
-    t = str(s or "").strip()
-    if not t:
-        return ""
-    if t.upper() in ("WO 3:0", "WO 3:0", "WO3:0"):
-        return "101"
-    if t.upper() in ("WO 0:3", "WO 0:3", "WO0:3"):
-        return "-101"
-    return t
 
 def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     """
