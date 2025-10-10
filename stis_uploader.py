@@ -35,6 +35,40 @@ SINGLES_COUNT           = 16    # kolik singlů se vyplňuje (2..17)
 
 from pathlib import Path
 import os, sys, shutil
+_A1COL = {c:i for i,c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ", start=1)}
+def a1_to_rc(a1: str):
+    """
+    'D2' -> (row=2, col=4)
+    'I3' -> (3, 9)
+    """
+    a1 = a1.strip().upper()
+    m = re.fullmatch(r"([A-Z]+)(\d+)", a1)
+    if not m:
+        raise ValueError(f"Bad A1 address: {a1}")
+    col_s, row_s = m.groups()
+    col = 0
+    for ch in col_s:
+        col = col * 26 + (ord(ch) - 64)
+    return int(row_s), int(col)
+
+def cell_value(sh, a1: str):
+    r, c = a1_to_rc(a1)
+    v = sh.cell(r, c).value
+    return ("" if v is None else str(v)).strip()
+
+def row_sets(sh, row: int, cols=("I","J","K","L","M")):
+    vals = []
+    for col in cols:
+        v = cell_value(sh, f"{col}{row}")
+        v = v.strip()
+        if v == "":
+            vals.append(None)  # prázdný set
+        else:
+            vals.append(v)
+    # ořízni trailing None (I…M často nemají všech 5 setů)
+    while vals and vals[-1] is None:
+        vals.pop()
+    return vals
 
 def prepare_playwright_browsers(logger):
     """
@@ -461,91 +495,83 @@ def read_zdroj_data(xlsx_path):
     
     return result
 
-def fill_online_from_zdroj(page, data, log, xlsx_path=None):
+def read_zdroj_data(xlsx_path, log):
     """
-    Vyplní online formulář STIS podle skutečné struktury DOM.
+    Vrátí:
+    {
+      "doubles": [
+        {"home1":..,"home2":..,"away1":..,"away2":..,"sets":[...]} ,   # c0
+        {"home1":..,"home2":..,"away1":..,"away2":..,"sets":[...]}     # c1
+      ],
+      "singles": [
+        {"idx": 2, "home":.., "away":.., "sets":[...]},   # d0 (Excel ř.7)
+        ...
+        {"idx":17, "home":.., "away":.., "sets":[...]}    # d15 (Excel ř.22)
+      ]
+    }
     """
-    doubles = data.get("doubles", [])
-    singles = data.get("singles", [])
-    
-    log("fill_online_from_zdroj: start – singles:", len(singles), "doubles:", len(doubles))
-    
-    try:
-        wait_online_ready(page, log)
-    except Exception:
-        log("Inputs se neobjevily – dělám dump DOMu.")
-        if xlsx_path:
-            _dom_dump(page, xlsx_path, log)
-        raise
-    
-    # CSS hack pro překrývající se ikony
-    page.add_style_tag(content="""
-        .button-karta, .button-karta * { pointer-events: none !important; }
-        .player-name { visibility: visible !important; opacity: 1 !important; }
-    """)
-    log("CSS hack aplikován.")
+    wb = load_workbook(xlsx_path, data_only=True)
+    if "zdroj" not in wb.sheetnames:
+        raise RuntimeError(f"V sešitu chybí list 'zdroj'. Máš: {', '.join(wb.sheetnames)}")
+    sh = wb["zdroj"]
 
-    # ---- ČTYŘHRA #1 ----
-    if len(doubles) >= 1:
-        dbl = doubles[0]
-        log("Vyplňuji čtyřhru #1 (c0)")
-        
-        if dbl.get("home1"):
-            _fill_player_by_click(page, "#c0 .cell-player:first-child .player.domaci .player-name", dbl["home1"], log)
-        if dbl.get("away1"):
-            _fill_player_by_click(page, "#c0 .cell-player:last-child .player.host .player-name", dbl["away1"], log)
-        if dbl.get("home2"):
-            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:first-child .player.domaci.hrac2 .player-name", dbl["home2"], log)
-        if dbl.get("away2"):
-            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:last-child .player.host.hrac2 .player-name", dbl["away2"], log)
-        
-        if dbl.get("sets"):
-            _fill_sets_by_event_index(page, 0, dbl["sets"], log)
+    log("== DEBUG EXCEL START ==")
 
-    # ---- ČTYŘHRA #2 ----
-    if len(doubles) >= 2:
-        dbl = doubles[1]
-        log("Vyplňuji čtyřhru #2 (c1)")
-        
-        if dbl.get("home1"):
-            _fill_player_by_click(page, "#c1 .cell-player:first-child .player.domaci .player-name", dbl["home1"], log)
-        if dbl.get("away1"):
-            _fill_player_by_click(page, "#c1 .cell-player:last-child .player.host .player-name", dbl["away1"], log)
-        if dbl.get("home2"):
-            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:first-child .player.domaci.hrac2 .player-name", dbl["home2"], log)
-        if dbl.get("away2"):
-            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:last-child .player.host.hrac2 .player-name", dbl["away2"], log)
-        
-        if dbl.get("sets"):
-            _fill_sets_by_event_index(page, 1, dbl["sets"], log)
+    # ---- Doubles #1 (c0) ----
+    c0 = {
+        "home1": cell_value(sh, "D2"),
+        "home2": cell_value(sh, "D3"),
+        "away1": cell_value(sh, "E2"),
+        "away2": cell_value(sh, "E3"),
+        "sets":  row_sets(sh, 3)
+    }
+    log(f"[EXCEL] c0.home1 D2 = {c0['home1']!r}")
+    log(f"[EXCEL] c0.home2 D3 = {c0['home2']!r}")
+    log(f"[EXCEL] c0.away1 E2 = {c0['away1']!r}")
+    log(f"[EXCEL] c0.away2 E3 = {c0['away2']!r}")
+    log(f"[EXCEL] c0.sets  I3–M3 = {c0['sets']}")
 
-    # ---- SINGLY ----
-    for match_data in singles:
-        excel_idx = int(match_data.get("idx", 0))
-        if excel_idx < 2 or excel_idx > 17:
-            continue
-        
-        dom_idx = excel_idx - 2
-        event_idx = excel_idx
-        
-        log(f"Zpracovávám singl Excel#{excel_idx} → DOM d{dom_idx} → event #{event_idx}")
-        
-        if match_data.get("home"):
-            _fill_player_by_click(page, f"#d{dom_idx} .player.domaci .player-name", match_data["home"], log)
-        if match_data.get("away"):
-            _fill_player_by_click(page, f"#d{dom_idx} .player.host .player-name", match_data["away"], log)
-        
-        if match_data.get("sets"):
-            _fill_sets_by_event_index(page, event_idx, match_data["sets"], log)
+    # ---- Doubles #2 (c1) ----
+    c1 = {
+        "home1": cell_value(sh, "D4"),
+        "home2": cell_value(sh, "D5"),
+        "away1": cell_value(sh, "E4"),
+        "away2": cell_value(sh, "E5"),
+        "sets":  row_sets(sh, 5)
+    }
+    log(f"[EXCEL] c1.home1 D4 = {c1['home1']!r}")
+    log(f"[EXCEL] c1.home2 D5 = {c1['home2']!r}")
+    log(f"[EXCEL] c1.away1 E4 = {c1['away1']!r}")
+    log(f"[EXCEL] c1.away2 E5 = {c1['away2']!r}")
+    log(f"[EXCEL] c1.sets  I5–M5 = {c1['sets']}")
 
-    # Uložit změny
-    log("Klikám 'Uložit změny'…")
-    try:
-        page.locator("input[name='ulozit']").click(timeout=5000)
-        page.wait_for_timeout(1000)
-        log("Změny uloženy.")
-    except Exception as e:
-        log(f"Uložení selhalo: {repr(e)}")
+    doubles = [c0, c1]
+
+    # ---- Singles d0..d15 (Excel řádky 7..22) ----
+    singles = []
+    excel_row = 7
+    for excel_idx in range(2, 18):  # 2..17
+        home = cell_value(sh, f"D{excel_row}")
+        away = cell_value(sh, f"E{excel_row}")
+        sets = row_sets(sh, excel_row)
+
+        log(f"[EXCEL] d{excel_idx-2}: idx={excel_idx}  D{excel_row}='{home}'  E{excel_row}='{away}'  I{excel_row}-M{excel_row}={sets}")
+
+        singles.append({
+            "idx":  excel_idx,   # POZOR: tohle používáme pro event_idx (sety)
+            "home": home,
+            "away": away,
+            "sets": sets
+        })
+        excel_row += 1
+
+    out = {"doubles": doubles, "singles": singles}
+
+    # Souhrn
+    log(f"[EXCEL] SUMMARY doubles: {[(d['home1'],d['home2'],d['away1'],d['away2'],d['sets']) for d in doubles]}")
+    log(f"[EXCEL] SUMMARY singles count={len(singles)} first={singles[0]} last={singles[-1]}")
+    log("== DEBUG EXCEL END ==")
+    return out
         
 def boot(msg: str):
     """Zapíš krátkou zprávu ještě před main() – přežije i selhání argparse."""
@@ -909,12 +935,36 @@ def main():
         log("Time (XLSX raw → parsed):", repr(team.get("zacatek_raw")), "→", team.get("zacatek"))
 
         # 1.5) data ze "zdroj"
+        # 1.5) data ze "zdroj"
         try:
+            # primárně zkusíme novou signaturu se 'log'
+            zdroj_data = read_zdroj_data(xlsx_path, log)
+        except TypeError:
+            # fallback: kdyby sis ještě nepřepsal signaturu, zavoláme starou a jen zalogujeme varování
+            log("WARNING: read_zdroj_data(xlsx_path, log) není k dispozici – volám starou verzi bez logování.")
             zdroj_data = read_zdroj_data(xlsx_path)
-            log("Zdroj data loaded - doubles:", len(zdroj_data.get("doubles", [])), "singles:", len(zdroj_data.get("singles", [])))
         except Exception as e:
             log("WARNING: Nepodařilo se načíst data ze 'zdroj' listu:", repr(e))
             zdroj_data = None
+        
+        if not zdroj_data:
+            log("WARNING: zdroj_data=None → nebude se vybírat žádný hráč (vyplní se jen sety, pokud jsou).")
+        else:
+            dbls = zdroj_data.get("doubles", []) or []
+            sgls = zdroj_data.get("singles", []) or []
+            log(f"Zdroj data loaded – doubles: {len(dbls)}, singles: {len(sgls)}")
+        
+            # Detailní výpis ČTYŘHER
+            for i, d in enumerate(dbls):
+                log(f"[EXCEL] c{i}: home1={d.get('home1')!r}, home2={d.get('home2')!r}, "
+                    f"away1={d.get('away1')!r}, away2={d.get('away2')!r}, sets={d.get('sets')}")
+        
+            # Detailní výpis SINGLŮ (každý řádek)
+            for s in sgls:
+                idx = s.get("idx")        # 2..17 (slouží jako event_idx)
+                dom_idx = (idx or 2) - 2  # 0..15 (slouží pro #d{dom_idx} v DOM)
+                log(f"[EXCEL] d{dom_idx}: idx={idx} home={s.get('home')!r} away={s.get('away')!r} sets={s.get('sets')}")
+
 
         headed = bool(getattr(args, "headed", True))
         headless = not headed
