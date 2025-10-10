@@ -159,137 +159,113 @@ def _diag_dump_cell(page, target, tag, log):
         log(f"  [diag] uložené: {cell_png.name}, {all_png.name}, {snip.name}")
     except Exception as e:
         log(f"  [diag] dump selhal: {e!r}")
+        
 def _fill_player_by_click(page, selector, name, log):
     """
-    Robustní aktivace a výběr hráče:
-    - zkusí klik na .player-name i .player (klik, dblclick, JS click, click na souřadnice)
-    - hledá input v buňce, v #zapis i kdekoli (viditelný)
-    - detailně loguje a ukládá diagnostiku, když se input neobjeví
+    RYCHLÁ verze (≤ ~2 s / jméno):
+      - Klikne na cílový .player-name
+      - Do aktivního inputu napíše jméno
+      - Počká kratce na menu a vybere POUZE přesnou shodu (bez diakritiky).
+      - Pokud přesná shoda není → žádný Enter/first! nechá prázdné a zaloguje ⚠
     """
     name = (name or "").strip()
     if not name:
         return
 
-    raw_sel = selector
-    sel = _normalize_player_selector(selector)
-    # Kandidátní klikatelná místa v pořadí
-    click_variants = [
-        raw_sel.replace(".player", ".player-name"),
-        sel,
-    ]
+    start_ts = time.time()
+    def left_budget():
+        return max(0, MAX_PER_NAME_MS/1000.0 - (time.time() - start_ts))
 
-    def try_activate(tag):
-        # 1) obyč klik
-        try:
-            target.scroll_into_view_if_needed(timeout=800)
-        except Exception:
-            pass
-        try:
-            target.click(timeout=800)
-            page.wait_for_timeout(120)
-            if _any_visible_input(page).count() or _any_input_in_zapis(page).count():
-                return "click"
-        except Exception:
-            pass
-
-        # 2) double-click
-        try:
-            target.dblclick(timeout=800)
-            page.wait_for_timeout(120)
-            if _any_visible_input(page).count() or _any_input_in_zapis(page).count():
-                return "dblclick"
-        except Exception:
-            pass
-
-        # 3) programový click (JS – některá SPA poslouchají jen „true“ MouseEvent)
-        try:
-            page.evaluate("""(el) => {
-                const ev = new MouseEvent('click', {bubbles:true, cancelable:true, view:window});
-                el.dispatchEvent(ev);
-            }""", target)
-            page.wait_for_timeout(120)
-            if _any_visible_input(page).count() or _any_input_in_zapis(page).count():
-                return "dispatch"
-        except Exception:
-            pass
-
-        # 4) click na souřadnice (uprostřed elementu)
-        try:
-            box = target.bounding_box()
-            if box:
-                page.mouse.move(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
-                page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
-                page.wait_for_timeout(140)
-                if _any_visible_input(page).count() or _any_input_in_zapis(page).count():
-                    return "coords"
-        except Exception:
-            pass
-
-        # 5) diagnostika (co se děje v DOM)
-        _diag_dump_cell(page, target, tag, log)
-        return None
-
-    start = time.time()
     try:
-        # Najdi kandidátní target a zkoušej různé aktivace
-        for variant in click_variants:
-            target = page.locator(variant).first
-            if not target.count():
-                continue
-            how = try_activate(tag=f"act_{variant.replace('#','').replace('.','_')}")
-            if not how:
-                # zkusíme ještě opačný kandidát (když jsme začali .player-name → .player a naopak)
-                continue
+        target = page.locator(selector).first
+        if not target.count():
+            log(f"  Nenalezen element: {selector}")
+            return
 
-            # Najdi input (buď v buňce, nebo obecně viditelný)
-            ac_input = target.locator("input.ui-autocomplete-input, input.ac_input, input[type='text']").filter(has_not=page.locator("[type='hidden']")).first
+        # klik do cíle
+        try:
+            target.click(timeout=FAST_CLICK_MS)
+        except Exception:
+            # ještě jeden pokus krátce
+            target.click(timeout=FAST_CLICK_MS)
+
+        page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+
+        # aktivní input (fokus)
+        ac_input = page.locator(
+            "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
+        ).first
+        if not ac_input.count():
+            # druhý pokus o fokus
+            target.click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+            page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+            ac_input = page.locator(
+                "input.ui-autocomplete-input:focus, input.ac_input:focus, input[type='text']:focus"
+            ).first
             if not ac_input.count():
-                ac_input = _any_input_in_zapis(page)
-            if not ac_input.count():
-                ac_input = _any_visible_input(page)
-
-            if not ac_input.count():
-                log(f"  ✗ {name} → {variant} aktivováno ({how}), ale žádný input")
-                _diag_dump_cell(page, target, f"noinput_{variant.replace('#','').replace('.','_')}", log)
-                continue
-
-            # napiš jméno a vyber přesnou shodu
-            ac_input.fill("")
-            ac_input.type(name, delay=0)
-            try:
-                page.wait_for_selector("ul.ui-autocomplete:visible, ul[type='listbox']:visible", timeout=1500)
-                menu = page.locator("ul.ui-autocomplete:visible li, ul[type='listbox']:visible li")
-                n = min(menu.count(), 15)
-                want_norms = {_norm_name(v) for v in _name_variants(name)}
-                pick = -1
-                for i in range(n):
-                    raw = (menu.nth(i).inner_text() or "").strip()
-                    base = _strip_menu_text(raw)
-                    if _norm_name(base) in want_norms:
-                        pick = i
-                        break
-                if pick >= 0:
-                    menu.nth(pick).click(timeout=800)
-                else:
-                    page.keyboard.press("ArrowDown")
-                    page.keyboard.press("Enter")
-            except Exception:
-                # žádné menu → zkus ArrowDown+Enter (některé implementace ho vyvolají i bez menu)
-                page.keyboard.press("ArrowDown")
-                page.keyboard.press("Enter")
-
-            shown = (target.inner_text() or "").strip()
-            if shown and shown != "----":
-                log(f"  ✓ {name} → {variant} ({how})")
+                log(f"  ✗ {name} → žádný aktivní input (selector {selector})")
                 return
-            else:
-                log(f"  ~ {name} → {variant} ({how}), ale v buňce stále '{shown or ''}'")
-                _diag_dump_cell(page, target, f"still_dash_{variant.replace('#','').replace('.','_')}", log)
 
-        # Pokud jsme došli až sem, nic nezabralo
-        log(f"  ✗ {name} → žádný input pro {sel} ani po více pokusech")
+        # napiš jméno: TYPE vyvolá keydown/keyup (někdy 'fill' nevyvolá ajax)
+        ac_input.fill("")
+        ac_input.type(name, delay=0)
+        page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+
+        # počkej krátce na menu
+        menu = None
+        try:
+            page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
+            menu = page.locator("ul.ui-autocomplete:visible li")
+        except Exception:
+            menu = None
+
+        want_norms = {_norm_name(v) for v in _name_variants(name)}
+
+        def find_exact(menu_loc):
+            if not menu_loc or menu_loc.count() == 0:
+                return -1
+            # projdi jen prvních pár (rychlost)
+            n = min(menu_loc.count(), 12)
+            for i in range(n):
+                raw = (menu_loc.nth(i).inner_text() or "").strip()
+                base = _strip_menu_text(raw)
+                if _norm_name(base) in want_norms:
+                    return i
+            return -1
+
+        idx = find_exact(menu)
+
+        # 1 rychlý pokus s opačným pořadím, pokud zbývá čas
+        if idx < 0 and left_budget() > 0.4:
+            variants = _name_variants(name)
+            if len(variants) == 2:
+                ac_input.fill("")
+                ac_input.type(variants[1], delay=0)
+                page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
+                try:
+                    page.wait_for_selector("ul.ui-autocomplete:visible", timeout=min(FAST_MENU_MS, int(left_budget()*1000)))
+                    menu = page.locator("ul.ui-autocomplete:visible li")
+                except Exception:
+                    menu = None
+                want_norms = {_norm_name(v) for v in _name_variants(variants[1])}
+                idx = find_exact(menu)
+
+        if idx >= 0:
+            menu.nth(idx).click(timeout=min(FAST_CLICK_MS, int(left_budget()*1000)))
+            # malý check labelu (bez čekání)
+            shown = (target.inner_text() or "").strip()
+            if shown and _norm_name(shown) in want_norms:
+                log(f"  ✓ {name} → {selector} (exact)")
+            else:
+                log(f"  ~ {name} → {selector} vybráno, ale zobrazeno '{shown}'")
+        else:
+            # rychle ukončit – žádné padání na první položku!
+            page.keyboard.press("Escape")
+            log(f"  ⚠ {name} → bez přesné shody (do 2s), ponecháno k ruční kontrole")
+
     except Exception as e:
-        log(f"  ✗ {name} → {sel} failed: {e!r}")
+        log(f"  ✗ {name} → {selector} failed: {repr(e)}")
+
 
 
 
