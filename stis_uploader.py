@@ -496,40 +496,21 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     if len(doubles) >= 1:
         dbl = doubles[0]
         log("Vyplňuji čtyřhru #1 (c0)")
-        
-        # Struktura: #c0 je první .cell-players, pak je druhý .cell-players (bez ID) pro druhé hráče
-        # V každém .cell-players jsou dvě .cell-player (domácí a host)
-        
+    
         if dbl.get("home1"):
-            _fill_player_by_click(
-                page, 
-                "#c0 .cell-player:first-child", 
-                dbl["home1"], 
-                log
-            )
+            _fill_player_by_click(page, "#c0 .cell-player:first-child", dbl["home1"], log)
         if dbl.get("away1"):
-            _fill_player_by_click(
-                page, 
-                #c0 .cell-player:last-child", 
-                dbl["away1"], 
-                log
-            )
-        
-        # Druhá dvojice - je v dalším .cell-players (sourozenec #c0)
+            _fill_player_by_click(page, "#c0 .cell-player:last-child",  dbl["away1"], log)
+    
+        # druhý pár (sourozenec #c0)
         if dbl.get("home2"):
-            _fill_player_by_click(
-                page, 
-                "#c0 + .cell-players .cell-player:first-child", 
-                dbl["home2"], 
-                log
-            )
+            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:first-child", dbl["home2"], log)
         if dbl.get("away2"):
-            _fill_player_by_click(
-                page, 
-                "#c0 + .cell-players .cell-player:last-child", 
-                dbl["away2"], 
-                log
-            )
+            _fill_player_by_click(page, "#c0 + .cell-players .cell-player:last-child",  dbl["away2"], log)
+    
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 0, dbl["sets"], log)
+
         
         # Sety pro čtyřhru #1 (event index 0)
         if dbl.get("sets"):
@@ -539,37 +520,21 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     if len(doubles) >= 2:
         dbl = doubles[1]
         log("Vyplňuji čtyřhru #2 (c1)")
-        
+    
         if dbl.get("home1"):
-            _fill_player_by_click(
-                page, 
-                "#c1 .cell-player:first-child .player.domaci .player-name", 
-                dbl["home1"], 
-                log
-            )
+            _fill_player_by_click(page, "#c1 .cell-player:first-child", dbl["home1"], log)
         if dbl.get("away1"):
-            _fill_player_by_click(
-                page, 
-                "#c1 .cell-player:last-child .player.host .player-name", 
-                dbl["away1"], 
-                log
-            )
-        
-        # Druhá dvojice - je v dalším .cell-players (sourozenec #c1)
+            _fill_player_by_click(page, "#c1 .cell-player:last-child",  dbl["away1"], log)
+    
+        # druhý pár (sourozenec #c1)
         if dbl.get("home2"):
-            _fill_player_by_click(
-                page, 
-                "#c1 + .cell-players .cell-player:first-child .player.domaci.hrac2 .player-name", 
-                dbl["home2"], 
-                log
-            )
+            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:first-child", dbl["home2"], log)
         if dbl.get("away2"):
-            _fill_player_by_click(
-                page, 
-                "#c1 + .cell-players .cell-player:last-child .player.host.hrac2 .player-name", 
-                dbl["away2"], 
-                log
-            )
+            _fill_player_by_click(page, "#c1 + .cell-players .cell-player:last-child",  dbl["away2"], log)
+    
+        if dbl.get("sets"):
+            _fill_sets_by_event_index(page, 1, dbl["sets"], log)
+
         
         # Sety pro čtyřhru #2 (event index 1)
         if dbl.get("sets"):
@@ -580,41 +545,23 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
     # V seznamu eventů: čtyřhry zabírají indexy 0,1; singly začínají od indexu 2
     
     for match_data in singles:
-        excel_idx = int(match_data.get("idx", 0))  # 2, 3, 4, ... 17
+        excel_idx = int(match_data.get("idx", 0))  # 2..17
         if excel_idx < 2 or excel_idx > 17:
             continue
-            
-        # DOM ID: d0-d15 (excel_idx - 2)
-        dom_idx = excel_idx - 2
-        
-        # Event index: Po dvou čtyřhrách (0,1) následují singly
-        # Excel idx 2 → d0 → event index 2
-        # Excel idx 3 → d1 → event index 3, atd.
+    
+        dom_idx   = excel_idx - 2
         event_idx = excel_idx
-        
+    
         log(f"Zpracovávám singl Excel#{excel_idx} → DOM d{dom_idx} → event #{event_idx}")
-        
-        # Domácí hráč
+    
         if match_data.get("home"):
-            _fill_player_by_click(
-                page, 
-                f"#d{idx} .cell-player:first-child", 
-                match_data["home"], 
-                log
-            )
-        
-        # Hostující hráč    
+            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:first-child", match_data["home"], log)
         if match_data.get("away"):
-            _fill_player_by_click(
-                page, 
-                f"#d{idx} .cell-player:last-child", 
-                match_data["away"], 
-                log
-            )
-        
-        # Sety
+            _fill_player_by_click(page, f"#d{dom_idx} .cell-player:last-child",  match_data["away"], log)
+    
         if match_data.get("sets"):
             _fill_sets_by_event_index(page, event_idx, match_data["sets"], log)
+
 
     # Uložit změny
     log("Klikám 'Uložit změny'…")
