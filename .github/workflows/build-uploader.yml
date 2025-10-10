@@ -49,8 +49,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force dist_pkg | Out-Null
           Copy-Item dist/stis-uploader.exe dist_pkg/
-          Copy-Item -Recurse -Force ms-playwright dist_pkg/ms-playwright
+          # Copy-Item -Recurse -Force ms-playwright dist_pkg/ms-playwright   # ← ZAKOMENTOVAT/SMMAZAT
           Compress-Archive -Path dist_pkg/* -DestinationPath stis-uploader.zip -Force
+
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
