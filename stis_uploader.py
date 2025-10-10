@@ -10,11 +10,12 @@ from playwright.sync_api import sync_playwright
 from playwright.sync_api import TimeoutError as PwTimeout
 
 # --- rychlé timeouty (ms) pro výběr hráčů ---
-FAST_CLICK_MS   = 800
+FAST_CLICK_MS   = 400
 FAST_FOCUS_MS   = 300
-FAST_MENU_MS    = 1500   # čekání na zobrazení autocomplete
+FAST_MENU_MS    = 700   # čekání na zobrazení autocomplete
 FAST_PAUSE_MS   = 80
 MAX_PER_NAME_MS = 1500  # tvrdý strop ~1.5 s na 1 jméno
+AFTER_SELECT_SLEEP_MS = 60
 
 DIAG_DIR = Path(os.getcwd()) / "stis_diag"
 DIAG_DIR.mkdir(exist_ok=True)
@@ -198,19 +199,22 @@ def _diag_dump_cell(page, target, tag, log):
         
 def _fill_player_by_click(page, selector, name, log):
     """
-    Aktivuje buňku hráče a vybere hráče.
-    1) Primárně podporuje <select class="player"> s <option>…</option>.
-    2) Fallback: autocomplete input (jQuery UI).
-    Vše hledá POUZE uvnitř buňky hráče – nikdy nepíše do setů.
+    FAST-PATH pro STIS: preferuje <select class="player"> v buňce (nejrychlejší cesta).
+    Na autocomplete spadne jen když select není.
+    - Hledá a pracuje POUZE uvnitř buňky hráče (nikdy nepíše do setů).
+    - Krátké timeouty, minimum čekání.
+    - Loguje výsledek (✓ / ~ / ⚠ / ✗).
     """
-    MENU_MS  = globals().get("FAST_MENU_MS", 1800)
-    CLICK_MS = globals().get("FAST_CLICK_MS", 800)
+    # krátké defaulty (můžeš si je dát i globálně nahoře v souboru)
+    MENU_MS  = globals().get("FAST_MENU_MS", 700)   # pro fallback autocomplete
+    CLICK_MS = globals().get("FAST_CLICK_MS", 400)
+    SLEEP_MS = globals().get("AFTER_SELECT_SLEEP_MS", 60)
 
     name = (name or "").strip()
     if not name:
         return
 
-    # --- odvoď selektor BUŇKY z dodaného selektoru ---
+    # --- odvoď selektor BUŇKY z dodaného selectoru ---
     cell_sel = None
     try:
         if " .cell-player:first-child" in selector or " .cell-player:last-child" in selector:
@@ -228,71 +232,31 @@ def _fill_player_by_click(page, selector, name, log):
         log(f"  ✗ {name} → Nenalezen element: {cell_sel or selector}")
         return
 
-    # DIAG před
+    # krátký DIAG „před“
     try:
         before_txt = (cell.inner_text() or "").strip()
         log(f"  → {name!r} @ {cell_sel or selector}  [before='{before_txt}']")
     except Exception:
         pass
 
-    # Kandidáti pro klik (nejdřív .player-name, pak .player, nakonec celá buňka)
-    click_targets = [
-        cell.locator(".player .player-name").first,
-        cell.locator(".player").first,
-        cell,
-    ]
-
-    def try_activation(tgt):
-        try:
-            try: tgt.scroll_into_view_if_needed(timeout=CLICK_MS)
-            except Exception: pass
-
-            tgt.click(timeout=CLICK_MS, force=True)
-            page.wait_for_timeout(140)
-            if cell.locator("select.player").first.count():
-                return "click-select", True
-
-            tgt.dblclick(timeout=CLICK_MS)
-            page.wait_for_timeout(140)
-            if cell.locator("select.player").first.count():
-                return "dblclick-select", True
-
-            try:
-                tgt.evaluate("""el => el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}))""")
-            except Exception:
-                pass
-            page.wait_for_timeout(140)
-            if cell.locator("select.player").first.count():
-                return "dispatch-select", True
-
-            box = tgt.bounding_box()
-            if box:
-                page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
-                page.wait_for_timeout(160)
-                if cell.locator("select.player").first.count():
-                    return "coords-select", True
-
-            return None, False
-        except Exception:
-            return None, False
-
-    how = None
-    for tgt in click_targets:
-        if not tgt.count():
-            continue
-        how, ok = try_activation(tgt)
-        if ok:
-            break
-
-    # === VĚTEV A: <select class="player"> je k dispozici ===
+    # ---------- FAST PATH: zkuste najít <select.player> i bez kliku ----------
     sel = cell.locator("select.player").first
-    if sel.count():
-        log(f"  aktivace OK ({how}); nalezen <select.player>")
+    if not sel.count():
+        # jeden krátký klik do buňky (bez dalších eskalací)
         try:
-            # načti všechny <option> a najdi shodu
+            try: cell.scroll_into_view_if_needed(timeout=CLICK_MS)
+            except Exception: pass
+            cell.click(timeout=CLICK_MS, force=True)
+            page.wait_for_timeout(50)
+        except Exception:
+            pass
+        sel = cell.locator("select.player").first
+
+    if sel.count():
+        # Máme <select class="player"> → vyber položku podle textu
+        try:
             options = sel.locator("option")
             cnt = options.count()
-            log(f"  select options: {cnt}")
             want_norms = {_norm_name(v) for v in _name_variants(name)}
             pick_value = None
 
@@ -303,25 +267,25 @@ def _fill_player_by_click(page, selector, name, log):
                     pick_value = options.nth(i).get_attribute("value")
                     break
 
-            # 2) fallback: příjmení (když celé jméno nezabere)
+            # 2) fallback: jen příjmení
             if not pick_value and " " in name:
-                surname = name.split()[-1]
-                want_surname = _norm_name(surname)
+                surname = _norm_name(name.split()[-1])
                 for i in range(cnt):
                     txt = (options.nth(i).inner_text() or "").strip()
-                    if _norm_name(_strip_menu_text(txt)).endswith(" " + want_surname) or _norm_name(_strip_menu_text(txt)) == want_surname:
+                    norm = _norm_name(_strip_menu_text(txt))
+                    if norm.endswith(" " + surname) or norm == surname:
                         pick_value = options.nth(i).get_attribute("value")
                         break
 
             if pick_value:
-                # proveď výběr + vyvolej change
                 sel.select_option(value=pick_value)
+                # krátké 'change' + minimální čekání
                 try:
                     sel.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
                 except Exception:
                     pass
+                page.wait_for_timeout(SLEEP_MS)
 
-                # kontrola po akci
                 after_txt = (cell.inner_text() or "").strip()
                 if after_txt and after_txt != "----":
                     if any(_norm_name(after_txt) == _norm_name(v) for v in _name_variants(name)):
@@ -330,58 +294,36 @@ def _fill_player_by_click(page, selector, name, log):
                         log(f"  ~ {name} → {cell_sel or selector} vybráno (select), ale zobrazeno '{after_txt}'")
                 else:
                     log(f"  ⚠ {name} → po selectu žádná změna (stále '{after_txt or ''}')")
-                    _diag_dump_cell(page, cell, f"nochange_{_norm_name(name)}", log)
                 return
             else:
-                log("  žádná shoda v <select> – přeskakuji (nepíšu do setů)")
-                _diag_dump_cell(page, cell, f"nomatch_select_{_norm_name(name)}", log)
+                log("  žádná shoda v <select> – přeskočeno")
                 return
         except Exception as e:
             log(f"  ✗ {name} → práce se <select> selhala: {e!r}")
-            _diag_dump_cell(page, cell, f"selectfail_{_norm_name(name)}", log)
             return
 
-    # === VĚTEV B: fallback na AUTOCOMPLETE (kdyby někde byl jiný typ pole) ===
-    # – hledáme input POUZE v buňce; nikdy nepoužít sety
-    ac_input = None
-    # jQuery UI inputy v buňce
-    ac_input = cell.locator("input.ui-autocomplete-input, input.ac_input").first
-    if not ac_input.count():
-        # poslední možnost: text input v buňce, ale NE .zapas-set / NE name^=set
-        plain = cell.locator("input[type='text']:not(.zapas-set):not([name^='set'])").first
-        ac_input = plain if plain.count() else None
-
-    if not ac_input:
+    # ---------- FALLBACK: AUTOCOMPLETE jen pokud select není ----------
+    ac = cell.locator("input.ui-autocomplete-input, input.ac_input").first
+    if not ac.count():
+        # poslední možnost: libovolný text input v buňce, ale NE sety
+        ac = cell.locator("input[type='text']:not(.zapas-set):not([name^='set'])").first
+    if not ac.count():
         log(f"  ✗ {name} → žádný hráčský input/select v buňce ({cell_sel or selector})")
-        _diag_dump_cell(page, cell, f"noinput_{_norm_name(name)}", log)
         return
 
-    log("  fallback: autocomplete input nalezen")
     try:
-        try: ac_input.fill("")
+        try: ac.fill("")
         except Exception: pass
-        ac_input.focus()
-        ac_input.type(name, delay=25)
-        try:
-            ac_input.evaluate("""
-                el => {
-                  el.dispatchEvent(new Event('input', {bubbles:true}));
-                  el.dispatchEvent(new KeyboardEvent('keyup', {key:' ', bubbles:true}));
-                }
-            """)
-        except Exception:
-            pass
+        ac.focus()
+        ac.type(name, delay=0)
+        page.wait_for_timeout(60)
 
         menu_sel = "ul.ui-autocomplete:visible, .ui-autocomplete.ui-menu:visible"
         page.wait_for_selector(menu_sel, timeout=MENU_MS)
         menu = page.locator(menu_sel).first.locator("li")
         cnt = menu.count()
-        log(f"  menu visible: items={cnt}")
-        for i in range(min(cnt, 8)):
-            raw = (menu.nth(i).inner_text() or "").strip()
-            log(f"    menu[{i}]={_strip_menu_text(raw)!r}")
-
         want_norms = {_norm_name(v) for v in _name_variants(name)}
+
         pick = -1
         for i in range(min(cnt, 20)):
             base = _strip_menu_text(menu.nth(i).inner_text() or "")
@@ -390,16 +332,11 @@ def _fill_player_by_click(page, selector, name, log):
                 break
 
         if pick < 0 and " " in name:
-            surname = name.split()[-1]
-            ac_input.fill(""); ac_input.focus(); ac_input.type(surname, delay=25)
+            # ještě zkus příjmení (rychle)
+            ac.fill(""); ac.focus(); ac.type(name.split()[-1], delay=0)
             page.wait_for_selector(menu_sel, timeout=MENU_MS)
             menu = page.locator(menu_sel).first.locator("li")
-            cnt = menu.count()
-            log(f"  menu (surname) items={cnt}")
-            for i in range(min(cnt, 6)):
-                raw = (menu.nth(i).inner_text() or "").strip()
-                log(f"    menuS[{i}]={_strip_menu_text(raw)!r}")
-            for i in range(min(cnt, 20)):
+            for i in range(min(menu.count(), 20)):
                 base = _strip_menu_text(menu.nth(i).inner_text() or "")
                 if _norm_name(base) in want_norms:
                     pick = i
@@ -407,9 +344,9 @@ def _fill_player_by_click(page, selector, name, log):
 
         if pick >= 0:
             menu.nth(pick).click(timeout=CLICK_MS)
+            page.wait_for_timeout(SLEEP_MS)
         else:
-            log("  přesná shoda nenačtena (autocomplete) – ukončuji bez zápisu do setů")
-            _diag_dump_cell(page, cell, f"nomatch_ac_{_norm_name(name)}", log)
+            log("  žádná shoda v autocomplete – přeskočeno")
             return
 
         after_txt = (cell.inner_text() or "").strip()
@@ -420,11 +357,9 @@ def _fill_player_by_click(page, selector, name, log):
                 log(f"  ~ {name} → {cell_sel or selector} vybráno (autocomplete), ale zobrazeno '{after_txt}'")
         else:
             log(f"  ⚠ {name} → žádná změna v buňce (stále '{after_txt or ''}')")
-            _diag_dump_cell(page, cell, f"nochange_{_norm_name(name)}", log)
 
     except Exception as e:
         log(f"  ✗ {name} → autocomplete selhal: {e!r}")
-        _diag_dump_cell(page, cell, f"acfail_{_norm_name(name)}", log)
 
 
 
