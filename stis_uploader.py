@@ -182,12 +182,16 @@ def _fill_player_by_click(page, selector, name, log):
             log(f"  Nenalezen element: {selector}")
             return
 
-        # klik do cíle
+         # klik do cíle
+        try:
+            target.scroll_into_view_if_needed(timeout=FAST_CLICK_MS)
+        except Exception:
+            pass
         try:
             target.click(timeout=FAST_CLICK_MS)
         except Exception:
-            # ještě jeden pokus krátce
             target.click(timeout=FAST_CLICK_MS)
+
 
         page.wait_for_timeout(min(FAST_PAUSE_MS, int(left_budget()*1000)))
 
@@ -452,6 +456,11 @@ def fill_online_from_zdroj(page, data, log, xlsx_path=None):
         if xlsx_path:
             _dom_dump(page, xlsx_path, log)
         raise
+    # HNED po wait_online_ready(page, log):
+    page.add_style_tag(content="""
+      .button-karta, .button-karta * { pointer-events: none !important; }
+    """)
+
 
     # ---- ČTYŘHRA #1 (ID: c0, event index 0) ----
     if len(doubles) >= 1:
