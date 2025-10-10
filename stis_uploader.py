@@ -199,20 +199,19 @@ def _diag_dump_cell(page, target, tag, log):
         
 def _fill_player_by_click(page, selector, name, log):
     """
-    FAST-PATH pro STIS: preferuje <select class="player"> v buňce (nejrychlejší cesta).
-    Na autocomplete spadne jen když select není.
-    - Hledá a pracuje POUZE uvnitř buňky hráče (nikdy nepíše do setů).
-    - Krátké timeouty, minimum čekání.
-    - Loguje výsledek (✓ / ~ / ⚠ / ✗).
+    BLESK výběr hráče:
+    1) Primárně <select class="player"> v buňce – options si vezmu najednou přes evaluate.
+    2) Jen když select není, zkusím rychlý autocomplete.
+    Vše POUZE uvnitř hráčské buňky (žádné sety).
     """
-    # krátké defaulty (můžeš si je dát i globálně nahoře v souboru)
-    MENU_MS  = globals().get("FAST_MENU_MS", 700)   # pro fallback autocomplete
-    CLICK_MS = globals().get("FAST_CLICK_MS", 400)
-    SLEEP_MS = globals().get("AFTER_SELECT_SLEEP_MS", 60)
-
     name = (name or "").strip()
     if not name:
         return
+
+    # krátké defaulty (když nejsou definované globálně)
+    MENU_MS  = globals().get("FAST_MENU_MS", 700)
+    CLICK_MS = globals().get("FAST_CLICK_MS", 400)
+    SLEEP_MS = globals().get("AFTER_SELECT_SLEEP_MS", 50)
 
     # --- odvoď selektor BUŇKY z dodaného selectoru ---
     cell_sel = None
@@ -232,77 +231,77 @@ def _fill_player_by_click(page, selector, name, log):
         log(f"  ✗ {name} → Nenalezen element: {cell_sel or selector}")
         return
 
-    # krátký DIAG „před“
+    # krátký log „před“
     try:
         before_txt = (cell.inner_text() or "").strip()
         log(f"  → {name!r} @ {cell_sel or selector}  [before='{before_txt}']")
     except Exception:
         pass
 
-    # ---------- FAST PATH: zkuste najít <select.player> i bez kliku ----------
+    # ---------- FAST SELECT PATH ----------
     sel = cell.locator("select.player").first
     if not sel.count():
-        # jeden krátký klik do buňky (bez dalších eskalací)
+        # jeden nenáročný klik, kdyby select vznikal až po kliku
         try:
             try: cell.scroll_into_view_if_needed(timeout=CLICK_MS)
             except Exception: pass
             cell.click(timeout=CLICK_MS, force=True)
-            page.wait_for_timeout(50)
+            page.wait_for_timeout(40)
         except Exception:
             pass
         sel = cell.locator("select.player").first
 
     if sel.count():
-        # Máme <select class="player"> → vyber položku podle textu
         try:
-            options = sel.locator("option")
-            cnt = options.count()
+            # vyčti všechny možnosti jedním JS voláním (žádné pomalé per-option dotazy)
+            opts = sel.evaluate("el => Array.from(el.options).map(o => ({v:o.value, t:(o.textContent||'').trim()}))")
+            # připrav normalizované varianty hledaného jména
             want_norms = {_norm_name(v) for v in _name_variants(name)}
-            pick_value = None
 
-            # 1) přesná shoda (normalizovaně)
-            for i in range(cnt):
-                txt = (options.nth(i).inner_text() or "").strip()
-                if _norm_name(_strip_menu_text(txt)) in want_norms:
-                    pick_value = options.nth(i).get_attribute("value")
-                    break
+            def pick_value_from_options(options):
+                # 1) přesná shoda (normalizovaně, bez „(rok, klub…)“ šumu)
+                for o in options:
+                    if _norm_name(_strip_menu_text(o.get('t',''))) in want_norms:
+                        return o.get('v')
+                # 2) fallback: samotné příjmení
+                parts = name.split()
+                if len(parts) >= 2:
+                    ln = _norm_name(parts[-1])
+                    for o in options:
+                        norm = _norm_name(_strip_menu_text(o.get('t','')))
+                        if norm.endswith(" " + ln) or norm == ln:
+                            return o.get('v')
+                return None
 
-            # 2) fallback: jen příjmení
-            if not pick_value and " " in name:
-                surname = _norm_name(name.split()[-1])
-                for i in range(cnt):
-                    txt = (options.nth(i).inner_text() or "").strip()
-                    norm = _norm_name(_strip_menu_text(txt))
-                    if norm.endswith(" " + surname) or norm == surname:
-                        pick_value = options.nth(i).get_attribute("value")
-                        break
-
-            if pick_value:
-                sel.select_option(value=pick_value)
-                # krátké 'change' + minimální čekání
-                try:
-                    sel.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
-                except Exception:
-                    pass
-                page.wait_for_timeout(SLEEP_MS)
-
-                after_txt = (cell.inner_text() or "").strip()
-                if after_txt and after_txt != "----":
-                    if any(_norm_name(after_txt) == _norm_name(v) for v in _name_variants(name)):
-                        log(f"  ✓ {name} → {cell_sel or selector} (select)  [after='{after_txt}']")
-                    else:
-                        log(f"  ~ {name} → {cell_sel or selector} vybráno (select), ale zobrazeno '{after_txt}'")
-                else:
-                    log(f"  ⚠ {name} → po selectu žádná změna (stále '{after_txt or ''}')")
-                return
-            else:
+            pick_val = pick_value_from_options(opts)
+            if not pick_val:
                 log("  žádná shoda v <select> – přeskočeno")
                 return
+
+            # vyber s krátkým timeoutem a vyvolej change
+            try:
+                sel.select_option(value=pick_val, timeout=500)
+            except Exception:
+                # poslední pokus: změň value přes JS + change
+                sel.evaluate("(el, v) => { el.value = v; el.dispatchEvent(new Event('change', {bubbles:true})); }", pick_val)
+
+            page.wait_for_timeout(SLEEP_MS)
+
+            after_txt = (cell.inner_text() or "").strip()
+            if after_txt and after_txt != "----":
+                if any(_norm_name(after_txt) == _norm_name(v) for v in _name_variants(name)):
+                    log(f"  ✓ {name} → {cell_sel or selector} (select)  [after='{after_txt}']")
+                else:
+                    log(f"  ~ {name} → {cell_sel or selector} vybráno (select), ale zobrazeno '{after_txt}'")
+            else:
+                log(f"  ⚠ {name} → po selectu žádná změna (stále '{after_txt or ''}')")
+            return
+
         except Exception as e:
             log(f"  ✗ {name} → práce se <select> selhala: {e!r}")
             return
 
-    # ---------- FALLBACK: AUTOCOMPLETE jen pokud select není ----------
+    # ---------- FALLBACK: AUTOCOMPLETE (jen pokud select není) ----------
     ac = cell.locator("input.ui-autocomplete-input, input.ac_input").first
     if not ac.count():
         # poslední možnost: libovolný text input v buňce, ale NE sety
@@ -316,31 +315,30 @@ def _fill_player_by_click(page, selector, name, log):
         except Exception: pass
         ac.focus()
         ac.type(name, delay=0)
-        page.wait_for_timeout(60)
+        page.wait_for_timeout(50)
 
         menu_sel = "ul.ui-autocomplete:visible, .ui-autocomplete.ui-menu:visible"
         page.wait_for_selector(menu_sel, timeout=MENU_MS)
         menu = page.locator(menu_sel).first.locator("li")
-        cnt = menu.count()
-        want_norms = {_norm_name(v) for v in _name_variants(name)}
 
+        # rychlý výběr shody
+        want_norms = {_norm_name(v) for v in _name_variants(name)}
         pick = -1
-        for i in range(min(cnt, 20)):
+        n = min(menu.count(), 20)
+        for i in range(n):
             base = _strip_menu_text(menu.nth(i).inner_text() or "")
             if _norm_name(base) in want_norms:
-                pick = i
-                break
+                pick = i; break
 
         if pick < 0 and " " in name:
-            # ještě zkus příjmení (rychle)
             ac.fill(""); ac.focus(); ac.type(name.split()[-1], delay=0)
             page.wait_for_selector(menu_sel, timeout=MENU_MS)
             menu = page.locator(menu_sel).first.locator("li")
-            for i in range(min(menu.count(), 20)):
+            n = min(menu.count(), 20)
+            for i in range(n):
                 base = _strip_menu_text(menu.nth(i).inner_text() or "")
                 if _norm_name(base) in want_norms:
-                    pick = i
-                    break
+                    pick = i; break
 
         if pick >= 0:
             menu.nth(pick).click(timeout=CLICK_MS)
@@ -360,6 +358,7 @@ def _fill_player_by_click(page, selector, name, log):
 
     except Exception as e:
         log(f"  ✗ {name} → autocomplete selhal: {e!r}")
+
 
 
 
