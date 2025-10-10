@@ -70,6 +70,263 @@ def row_sets(sh, row: int, cols=("I","J","K","L","M")):
     while vals and vals[-1] is None:
         vals.pop()
     return vals
+def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_club=True):
+    """
+    Vyplní 'Vedoucí družstev' (Domácí/Hosté) na úvodním formuláři.
+    - Používá jQuery UI autocomplete: napíše dotaz, POČKÁ na menu, vybere exact shodu klikem.
+    - Volitelně zapne 'Jen z oddílu'.
+    - Po výběru udělá blur/tab a krátce čekne, že hodnota zůstala.
+    """
+    MENU_MS  = 1500
+    TYPE_DLY = 20
+    SLEEP_MS = 80
+
+    def _by_label(label_text: str):
+        # Nejrobustnější je Playwright "get_by_label"
+        try:
+            return page.get_by_label(label_text, exact=True)
+        except Exception:
+            # fallback – najít label a první input za ním
+            lbl = page.locator(f"label:has-text('{label_text}')").first
+            if lbl.count():
+                return lbl.locator("xpath=following::input[1]")
+            return page.locator("input[aria-label='%s']" % label_text).first
+
+    def _ensure_only_from_club():
+        if not only_from_club:
+            return
+        try:
+            # zkuste standardní label
+            cb = page.get_by_label("Jen z oddílu", exact=True)
+        except Exception:
+            # fallback – checkbox poblíž textu
+            cb = page.locator("text=Jen z oddílu").locator("xpath=preceding::input[@type='checkbox'][1]")
+        try:
+            if cb and cb.count():
+                cb.check(timeout=500)
+                log("  [leaders] 'Jen z oddílu' zaškrtnuto")
+        except Exception:
+            pass
+
+    def _pick_from_autocomplete(input_loc, full_name: str) -> bool:
+        full_name = (full_name or "").strip()
+        if not full_name or not input_loc or not input_loc.count():
+            return False
+
+        # vyčištění + fokus
+        try:
+            input_loc.fill("")
+        except Exception:
+            pass
+        try:
+            input_loc.focus()
+        except Exception:
+            pass
+
+        # napiš dotaz (stačí příjmení, ale dáme celé jméno)
+        page.keyboard.type(full_name, delay=TYPE_DLY)
+
+        # vynutíme DOM události
+        try:
+            input_loc.evaluate("""
+                el => {
+                    el.dispatchEvent(new Event('input', {bubbles:true}));
+                    el.dispatchEvent(new KeyboardEvent('keyup', {key:' ', bubbles:true}));
+                }
+            """)
+        except Exception:
+            pass
+
+        menu_sel = "ul.ui-autocomplete:visible, .ui-autocomplete.ui-menu:visible"
+        try:
+            page.wait_for_selector(menu_sel, timeout=MENU_MS)
+        except Exception:
+            # zkus explicitní jQuery search
+            try:
+                input_loc.evaluate("""el => { if (window.jQuery && jQuery.fn.autocomplete) { jQuery(el).autocomplete('search', el.value || ''); } }""")
+                page.wait_for_selector(menu_sel, timeout=MENU_MS)
+            except Exception:
+                log(f"  [leaders] menu se neukázalo pro {full_name!r}")
+                return False
+
+        # najdi přesnou shodu v li
+        menu = page.locator(menu_sel).first.locator("li")
+        cnt = menu.count()
+        if not cnt:
+            log(f"  [leaders] prázdné menu pro {full_name!r}")
+            return False
+
+        want = {_norm_name(v) for v in _name_variants(full_name)}
+        pick = -1
+        n = min(cnt, 30)
+        for i in range(n):
+            raw = (menu.nth(i).inner_text() or "").strip()
+            base = _strip_menu_text(raw)
+            if _norm_name(base) in want:
+                pick = i
+                break
+
+        # fallback: čisté příjmení
+        if pick < 0 and " " in full_name:
+            surname = full_name.split()[-1]
+            input_loc.fill("")
+            input_loc.focus()
+            page.keyboard.type(surname, delay=TYPE_DLY)
+            try:
+                page.wait_for_selector(menu_sel, timeout=MENU_MS)
+                menu = page.locator(menu_sel).first.locator("li")
+                n = min(menu.count(), 30)
+                want = {_norm_name(v) for v in _name_variants(full_name)}
+                for i in range(n):
+                    base = _strip_menu_text(menu.nth(i).inner_text() or "")
+                    if _norm_name(base) in want:
+                        pick = i
+                        break
+            except Exception:
+                pass
+
+        if pick < 0:
+            log(f"  [leaders] nenašla se přesná shoda pro {full_name!r}")
+            return False
+
+        # klik na položku
+        try:
+            menu.nth(pick).click(timeout=500)
+        except Exception:
+            # ultimate fallback: Enter
+            page.keyboard.press("Enter")
+
+        # blur (potřebuje ho často hidden field/binding)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(SLEEP_MS)
+
+        # ověř, že v inputu zůstalo vybrané jméno
+        try:
+            val = input_loc.input_value(timeout=400)
+        except Exception:
+            val = (input_loc.evaluate("el => el.value") or "")
+        ok = bool(val) and _norm_name(val) in {_norm_name(v) for v in _name_variants(full_name)}
+        return ok
+
+    # === vlastní vyplnění ===
+    _ensure_only_from_club()
+
+    home_input  = _by_label("Domácí:")
+    away_input  = _by_label("Hosté:")
+
+    ok_home = _pick_from_autocomplete(home_input, home_name)
+    log(f"Vedoucí domácích: {home_name}  → {'OK' if ok_home else 'NEULOŽENO'}")
+
+    ok_away = _pick_from_autocomplete(away_input, away_name)
+    log(f"Vedoucí hostů: {away_name}     → {'OK' if ok_away else 'NEULOŽENO'}")
+
+    return ok_home and ok_away
+
+def fill_playroom(page, wanted_text: str, log):
+    """
+    Vybere 'Hrací místnost' v úvodním formuláři.
+    - Nejprve se pokusí o přesnou shodu podle textu <option>.
+    - Když nic, vybere první smysluplnou položku (ne placeholder).
+    Vrací True/False podle toho, zda se něco vybralo.
+    """
+    CLICK_MS = 400
+    SLEEP_MS = 60
+
+    # 1) najdi <select> dle labelu "Hrací místnost"
+    def _select_by_label(label_txt: str):
+        try:
+            # Playwright label matcher
+            return page.get_by_label(label_txt, exact=True)
+        except Exception:
+            pass
+        # fallback: najdi label a první select za ním
+        lbl = page.locator(f"label:has-text('{label_txt}')").first
+        if lbl.count():
+            sel = lbl.locator("xpath=following::select[1]")
+            if sel.count():
+                return sel.first
+        # poslední fallback – globální select poblíž textu
+        return page.locator("select").first
+
+    sel = _select_by_label("Hrací místnost")
+    if not sel or not sel.count():
+        log("  [playroom] <select> pro 'Hrací místnost' nenalezen")
+        return False
+
+    try:
+        try:
+            sel.scroll_into_view_if_needed(timeout=CLICK_MS)
+        except Exception:
+            pass
+
+        # 2) vyčti všechny options jedním krokem (rychlé)
+        options = sel.evaluate(
+            "el => Array.from(el.options).map(o => ({v:o.value, t:(o.textContent||'').trim()}))"
+        ) or []
+
+        if not options:
+            log("  [playroom] select nemá položky")
+            return False
+
+        # 3) najdi přesnou shodu (normalizovaně, bez šumu typu závorek)
+        wanted_norms = set()
+        if wanted_text:
+            wanted_norms = {_norm_name(_strip_menu_text(wanted_text))}
+
+        pick_value = None
+
+        if wanted_norms:
+            for o in options:
+                if _norm_name(_strip_menu_text(o.get("t", ""))) in wanted_norms:
+                    pick_value = o.get("v")
+                    break
+
+        # 4) když nic – vem první „reálnou“ položku (ne placeholdery)
+        if not pick_value:
+            for o in options:
+                t = (o.get("t") or "").strip()
+                v = (o.get("v") or "").strip()
+                # přeskoč prázdné/placeholder
+                if not v:
+                    continue
+                if t.startswith("- zvolte") or t.startswith("- vyberte"):
+                    continue
+                pick_value = v
+                break
+
+        if not pick_value:
+            log("  [playroom] žádná vhodná položka k výběru")
+            return False
+
+        # 5) vyber + change
+        try:
+            sel.select_option(value=pick_value, timeout=500)
+        except Exception:
+            # emergency: nastav přímo value a vyvolej change
+            sel.evaluate(
+                "(el, v) => { el.value = v; el.dispatchEvent(new Event('change', {bubbles:true})); }",
+                pick_value,
+            )
+        else:
+            # jistota: i po select_option vystřel change
+            try:
+                sel.evaluate("el => el.dispatchEvent(new Event('change', {bubbles:true}))")
+            except Exception:
+                pass
+
+        page.wait_for_timeout(SLEEP_MS)
+
+        # 6) kontrola – přečti zobrazený text vybrané option
+        chosen = sel.evaluate(
+            "el => (el.selectedOptions && el.selectedOptions[0] ? el.selectedOptions[0].textContent : el.options[el.selectedIndex]?.textContent) || ''"
+        ) or ""
+        chosen = chosen.strip()
+        log(f"  [playroom] vybráno: '{chosen}'")
+        return True
+
+    except Exception as e:
+        log(f"  [playroom] selhání: {e!r}")
+        return False
 
 def prepare_playwright_browsers(logger):
     """
@@ -995,46 +1252,38 @@ def main():
         log("Time (XLSX raw → parsed):", repr(team.get("zacatek_raw")), "→", team.get("zacatek"))
 
         # 1.5) data ze "zdroj"
-        # 1.5) data ze "zdroj"
         try:
-            # primárně zkusíme novou signaturu se 'log'
-            zdroj_data = read_zdroj_data(xlsx_path, log)
+            zdroj_data = read_zdroj_data(xlsx_path, log)  # NOVÁ signatura s log
         except TypeError:
-            # fallback: kdyby sis ještě nepřepsal signaturu, zavoláme starou a jen zalogujeme varování
             log("WARNING: read_zdroj_data(xlsx_path, log) není k dispozici – volám starou verzi bez logování.")
             zdroj_data = read_zdroj_data(xlsx_path)
         except Exception as e:
             log("WARNING: Nepodařilo se načíst data ze 'zdroj' listu:", repr(e))
             zdroj_data = None
-        
+
         if not zdroj_data:
             log("WARNING: zdroj_data=None → nebude se vybírat žádný hráč (vyplní se jen sety, pokud jsou).")
         else:
             dbls = zdroj_data.get("doubles", []) or []
             sgls = zdroj_data.get("singles", []) or []
             log(f"Zdroj data loaded – doubles: {len(dbls)}, singles: {len(sgls)}")
-        
-            # Detailní výpis ČTYŘHER
             for i, d in enumerate(dbls):
                 log(f"[EXCEL] c{i}: home1={d.get('home1')!r}, home2={d.get('home2')!r}, "
                     f"away1={d.get('away1')!r}, away2={d.get('away2')!r}, sets={d.get('sets')}")
-        
-            # Detailní výpis SINGLŮ (každý řádek)
             for s in sgls:
-                idx = s.get("idx")        # 2..17 (slouží jako event_idx)
-                dom_idx = (idx or 2) - 2  # 0..15 (slouží pro #d{dom_idx} v DOM)
+                idx = s.get("idx")
+                dom_idx = (idx or 2) - 2
                 log(f"[EXCEL] d{dom_idx}: idx={idx} home={s.get('home')!r} away={s.get('away')!r} sets={s.get('sets')}")
 
-
-        headed = bool(getattr(args, "headed", True))
+        headed   = bool(getattr(args, "headed", True))
         headless = not headed
 
-        # >>> ZDE JE NOVÝ BLOK <<<
-        prepare_playwright_browsers(log)   # nastaví PLAYWRIGHT_BROWSERS_PATH na přibalenou/sousední složku
-        ensure_pw_browsers(log)            # případně doinstaluje Chromium do této složky
+        # 2) připrav Playwright runtime
+        prepare_playwright_browsers(log)   # nastaví PLAYWRIGHT_BROWSERS_PATH
+        ensure_pw_browsers(log)            # případně doinstaluje Chromium
 
         with sync_playwright() as p:
-            # 2) spuštění prohlížeče (Chromium → Chrome → Edge)
+            # 3) spuštění prohlížeče (Chromium → Chrome → Edge)
             log("Launching browser… headless =", headless)
             browser = None
             try:
@@ -1053,10 +1302,10 @@ def main():
             context = browser.new_context()
             page = context.new_page()
 
-            # ... zbytek main() nech beze změny ...
+            # DŮLEŽITÉ: krátký default timeout (žádné 30s visení)
+            page.set_default_timeout(1500)
 
-
-            # 3) login
+            # 4) login
             log("Navigating to login…")
             page.goto("https://registr.ping-pong.cz/htm/auth/login.php",
                       wait_until="domcontentloaded")
@@ -1066,46 +1315,46 @@ def main():
             page.wait_for_load_state("domcontentloaded")
             log("Logged in.")
 
-            # 4) stránka družstva
+            # 5) stránka družstva
             team_url = f"https://registr.ping-pong.cz/htm/auth/klub/druzstva/vysledky/?druzstvo={team['id']}"
             log("Open team page:", team_url)
             page.goto(team_url, wait_until="domcontentloaded")
 
-            # 5) najdi vstup do formuláře (vložit/upravit)
+            # 6) najdi vstup do formuláře (vložit/upravit)
             log("Hledám odkaz 'vložit/upravit zápis'…")
             if not open_match_form(page, log):
                 raise RuntimeError("Na stránce družstva jsem nenašel odkaz do formuláře.")
 
-            # 6) vyplň úvodní údaje (herna / začátek / vedoucí)
-            if team.get("herna") and page.locator("input[name='zapis_herna']").count():
-                page.fill("input[name='zapis_herna']", str(team["herna"]))
-                log("Herna vyplněna:", team["herna"])
+            # 7) vyplň úvodní údaje (herna / začátek / vedoucí)
+            # 7.1) Hrací místnost (SELECT podle labelu „Hrací místnost“)
+            wanted_room_text = (team.get("hraci_mistnost") or team.get("herna") or "").strip()
+            ok_room = fill_playroom(page, wanted_text=wanted_room_text, log=log)
+            log(f"Hrací místnost → {'OK' if ok_room else 'NEVYBRÁNA'}")
 
-            # OPRAVA: Robustnější nastavení času
+            # 7.2) Začátek utkání (hh:mm)
             start_txt = (team.get("zacatek") or "19:00").strip()
             try:
                 if ":" in start_txt:
                     hh, mm = start_txt.split(":")[:2]
                 else:
                     hh, mm = "19", "00"
-                
-                hh = int(hh)
-                mm = int(mm)
-                
+                hh = int(hh); mm = int(mm)
+
                 if page.locator("select[name='zapis_zacatek_hodiny']").count():
                     page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
                     log(f"Hodina nastavena: {hh:02d}")
-                    
                 if page.locator("select[name='zapis_zacatek_minuty']").count():
                     page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
                     log(f"Minuta nastavena: {mm:02d}")
-                    
-                page.evaluate("document.querySelector('select[name=\"zapis_zacatek_hodiny\"]').dispatchEvent(new Event('change'))")
-                page.evaluate("document.querySelector('select[name=\"zapis_zacatek_minuty\"]').dispatchEvent(new Event('change'))")
-                page.wait_for_timeout(500)
-                
+
+                # vystřel change na obou selectech
+                try:
+                    page.evaluate("document.querySelector('select[name=\"zapis_zacatek_hodiny\"]').dispatchEvent(new Event('change',{bubbles:true}))")
+                    page.evaluate("document.querySelector('select[name=\"zapis_zacatek_minuty\"]').dispatchEvent(new Event('change',{bubbles:true}))")
+                except Exception:
+                    pass
+                page.wait_for_timeout(200)
                 log("Začátek nastaven:", f"{hh:02d}:{mm:02d}")
-                
             except Exception as e:
                 log("Set start time failed:", repr(e))
                 try:
@@ -1114,115 +1363,92 @@ def main():
                     log("Fallback čas: 19:00")
                 except Exception:
                     pass
-            
-            # Vedoucí - vyplň jen když je pole povolené a prázdné
-            try:
-                vi = page.locator("input[name='id_domaci_vedoucitext']")
-                if vi.count():
-                    val = (vi.get_attribute("value") or "").strip()
-                    if vi.is_disabled() or val:
-                        log("Vedoucí domácích (locked/filled):", val or "(prázdné)")
-                    elif team.get("ved_dom"):
-                        vi.fill(str(team["ved_dom"]))
-                        page.keyboard.press("Tab")
-                        page.wait_for_timeout(300)
-                        log("Vedoucí domácích:", team["ved_dom"])
-            except Exception as e:
-                log("Vedoucí domácích selhal:", repr(e))
-            
-            try:
-                vi = page.locator("input[name='id_hoste_vedoucitext']")
-                if vi.count():
-                    val = (vi.get_attribute("value") or "").strip()
-                    if vi.is_disabled() or val:
-                        log("Vedoucí hostů (locked/filled):", val or "(prázdné)")
-                    elif team.get("ved_host"):
-                        vi.fill(str(team["ved_host"]))
-                        page.keyboard.press("Tab")
-                        page.wait_for_timeout(300)
-                        log("Vedoucí hostů:", team["ved_host"])
-            except Exception as e:
-                log("Vedoucí hostů selhal:", repr(e))
-                
-            # 7) Vícekrát zkus odeslat formulář dokud nezmizí chyba
+
+            # 7.3) Vedoucí družstev (autocomplete → vybrat položku z menu)
+            leaders_only_from_club = bool(team.get("leaders_only_from_club", True))
+            ok_leaders = fill_leaders_on_start(
+                page,
+                home_name=str(team.get("ved_dom") or "").strip(),
+                away_name=str(team.get("ved_host") or "").strip(),
+                log=log,
+                only_from_club=leaders_only_from_club,
+            )
+            log(f"Vedoucí → {'OK' if ok_leaders else 'NEULOŽENO'}")
+
+            # 8) Odeslat úvodní formulář (s malým retry na chybovou hlášku času)
             max_attempts = 3
             for attempt in range(max_attempts):
                 log(f"Pokus {attempt+1}/{max_attempts}: Click 'Uložit a pokračovat'…")
-                
                 try:
                     btn = page.locator("input[name='odeslat']")
                     if btn.count():
-                        btn.click(timeout=5000)
+                        btn.click(timeout=1500)
                         page.wait_for_load_state("domcontentloaded")
                         log("Formulář odeslán")
-                        
+
+                        # jestli server stále křičí na čas, krátce přenastav a zkus znovu
                         if page.locator(".exception:has-text('není vyplněn začátek utkání')").count():
                             log(f"Pokus {attempt+1}: Server stále hlásí chybu s časem")
                             if attempt < max_attempts - 1:
                                 page.select_option("select[name='zapis_zacatek_hodiny']", value=str(hh))
                                 page.select_option("select[name='zapis_zacatek_minuty']", value=str(mm))
-                                page.wait_for_timeout(500)
+                                page.wait_for_timeout(200)
                                 continue
-                        else:
-                            log("Formulář úspěšně odeslán bez chyby")
-                            break
-                            
+                        break
                 except Exception as e:
                     log(f"Pokus {attempt+1} selhal:", repr(e))
                     if attempt == max_attempts - 1:
                         raise RuntimeError("Nepodařilo se odeslat formulář ani po několika pokusech")
-                    
-            # 8) Čekej na online editor
+
+            # 9) Čekej na online editor a vyplň
             try:
                 page.wait_for_function(
                     "window.location.href.includes('online.php') || document.querySelector('input.zapas-set') !== null",
                     timeout=30000
                 )
                 log("Online editor dostupný na:", page.url)
-                
-                # 9) KONEČNĚ: Vyplň data ze zdroj listu
+
+                # krátký default timeout i pro online část
+                page.set_default_timeout(1500)
+
                 if zdroj_data:
-                    log("Začínám vyplňovat sestavy a sety...")
+                    log("Začínám vyplňovat sestavy a sety…")
                     fill_online_from_zdroj(page, zdroj_data, log, xlsx_path)
                     log("Sestavy a sety vyplněny")
                 else:
                     log("VAROVÁNÍ: Žádná data ze 'zdroj' listu k vyplnění")
-                    
             except Exception as e:
                 log("Problém s online editorem:", repr(e))
                 if xlsx_path:
                     _dom_dump(page, xlsx_path, log)
                 raise
-            
-            # 10) UPRAVENÉ: Okno zůstane otevřené pro ruční kontrolu a zavření
+
+            # 10) Ukončení
             if headed:
                 log("=" * 60)
                 log("HOTOVO! Okno prohlížeče zůstává otevřené.")
                 log("Zkontrolujte vyplněná data a ručně zavřete okno prohlížeče.")
                 log("Program se ukončí až po zavření okna.")
                 log("=" * 60)
-                
                 try:
                     page.wait_for_event("close", timeout=0)
                     log("Okno prohlížeče bylo zavřeno uživatelem.")
                 except Exception as e:
                     log("Čekání na zavření okna skončilo:", repr(e))
                 finally:
-                    try: 
-                        context.close()
-                        log("Browser context uzavřen.")
-                    except Exception: 
+                    try:
+                        context.close(); log("Browser context uzavřen.")
+                    except Exception:
                         pass
-                    try: 
-                        browser.close()
-                        log("Browser uzavřen.")
-                    except Exception: 
+                    try:
+                        browser.close(); log("Browser uzavřen.")
+                    except Exception:
                         pass
             else:
-                log("Headless režim - zavírám browser automaticky.")
+                log("Headless režim – zavírám browser automaticky.")
                 try: context.close()
                 except Exception: pass
-                try: browser.close() 
+                try: browser.close()
                 except Exception: pass
 
     except Exception as e:
