@@ -70,12 +70,14 @@ def row_sets(sh, row: int, cols=("I","J","K","L","M")):
     while vals and vals[-1] is None:
         vals.pop()
     return vals
-def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_club=True):
+def fill_leaders_on_start(page, home_name_text: str, away_name_text: str, log, only_from_club=True):
     """
-    Vyplní 'Vedoucí družstev' (Domácí/Hosté) na úvodním formuláři.
+    Vyplní 'Vedoucí družstev' s PODMÍNKOU PŘESNÉ SHODY CELÉHO TEXTU položky.
     - Viditelné inputy:  id_domaci_vedoucitext / id_hoste_vedoucitext
     - Skrytá ID:         id_domaci_vedouciid   / id_hoste_vedouciid
     - Checkboxy 'Jen z oddílu': name='chbklub' a 'chbklub2'
+    - ŽÁDNÉ fallbacky na první položku, žádná fuzzy shoda.
+    - Když shoda není, vrátí False a zaloguje seznam položek (pro korekci textu).
     """
     MENU_MS  = 1500
     TYPE_DLY = 20
@@ -93,23 +95,30 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
             except Exception:
                 pass
 
-    def _pick(input_sel: str, hidden_sel: str, full_name: str) -> bool:
-        full_name = (full_name or "").strip()
-        if not full_name:
+    def _pick_exact(input_sel: str, hidden_sel: str, full_display_text: str) -> bool:
+        full_display_text = (full_display_text or "").strip()
+        if not full_display_text:
+            log(f"  [leaders] požadovaný text je prázdný pro {input_sel}")
             return False
 
         inp = page.locator(input_sel).first
+        hid = page.locator(hidden_sel).first
         if not inp.count():
             log(f"  [leaders] input {input_sel} nenalezen")
             return False
 
-        # vyčištění + fokus
+        # vynuluj hidden před volbou (ať víme, že se po výběru nastavilo)
+        try:
+            if hid.count():
+                hid.evaluate("el => { el.value=''; }")
+        except Exception:
+            pass
+
+        # vyčištění + fokus + psaní
         try: inp.fill("")
         except Exception: pass
         inp.focus()
-
-        # napiš dotaz
-        page.keyboard.type(full_name, delay=TYPE_DLY)
+        page.keyboard.type(full_display_text, delay=TYPE_DLY)
         try:
             inp.evaluate("""
                 el => {
@@ -120,6 +129,7 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
         except Exception:
             pass
 
+        # počkej na menu, případně explicitně vyvolej jQuery autocomplete
         menu_sel = "ul.ui-autocomplete:visible, .ui-autocomplete.ui-menu:visible"
         try:
             page.wait_for_selector(menu_sel, timeout=MENU_MS)
@@ -128,44 +138,34 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
                 inp.evaluate("el => { if (window.jQuery && jQuery.fn.autocomplete) jQuery(el).autocomplete('search', el.value||''); }")
                 page.wait_for_selector(menu_sel, timeout=MENU_MS)
             except Exception:
-                log(f"  [leaders] menu se neukázalo pro {full_name!r}")
+                log(f"  [leaders] menu se neukázalo pro přesný text {full_display_text!r}")
                 return False
 
+        # načti položky a hledej PŘESNOU shodu CELÉHO textu (po ořezu mezer)
         menu = page.locator(menu_sel).first.locator("li")
         cnt = menu.count()
         if not cnt:
-            log(f"  [leaders] prázdné menu pro {full_name!r}")
+            log(f"  [leaders] prázdné menu pro {full_display_text!r}")
             return False
 
-        want = {_norm_name(v) for v in _name_variants(full_name)}
-        pick = -1
-        n = min(cnt, 30)
-        for i in range(n):
-            raw = (menu.nth(i).inner_text() or "").strip()
-            if _norm_name(_strip_menu_text(raw)) in want:
-                pick = i; break
+        # DIAG: ukaž pár položek (pro případ, že se text v menu liší)
+        show = min(cnt, 12)
+        items = [(i, (menu.nth(i).inner_text() or "").strip()) for i in range(show)]
+        log("  [leaders] menu:", "; ".join([f"{i}:{t}" for i,t in items]))
 
-        if pick < 0 and " " in full_name:
-            # fallback: příjmení
-            surname = full_name.split()[-1]
-            try: inp.fill("")
-            except Exception: pass
-            inp.focus(); page.keyboard.type(surname, delay=TYPE_DLY)
-            try:
-                page.wait_for_selector(menu_sel, timeout=MENU_MS)
-                menu = page.locator(menu_sel).first.locator("li")
-                n = min(menu.count(), 30)
-                for i in range(n):
-                    if _norm_name(_strip_menu_text(menu.nth(i).inner_text() or "")) in want:
-                        pick = i; break
-            except Exception:
-                pass
+        pick = -1
+        wanted = (full_display_text or "").strip()
+        for i in range(cnt):
+            txt = (menu.nth(i).inner_text() or "").strip()
+            if txt == wanted:
+                pick = i
+                break
 
         if pick < 0:
-            log(f"  [leaders] nenašla se přesná shoda pro {full_name!r}")
+            log(f"  [leaders] PŘESNÁ shoda nenaalezena: {wanted!r}  → nevybráno")
             return False
 
-        # vybrat položku + blur (commit)
+        # klik na přesnou položku + blur (commit)
         try:
             menu.nth(pick).click(timeout=800)
         except Exception:
@@ -173,9 +173,9 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
         page.keyboard.press("Tab")
         page.wait_for_timeout(SLEEP_MS)
 
-        # ověř skryté ID i viditelný text – jen to garantuje uložení
+        # ověř skryté ID i viditelný text
         try:
-            hid_val = (page.locator(hidden_sel).first.get_attribute("value") or "").strip()
+            hid_val = (hid.get_attribute("value") or "").strip() if hid.count() else ""
         except Exception:
             hid_val = ""
         try:
@@ -183,18 +183,19 @@ def fill_leaders_on_start(page, home_name: str, away_name: str, log, only_from_c
         except Exception:
             vis_val = (inp.evaluate("el => el.value") or "").strip()
 
-        ok = bool(hid_val) and bool(vis_val)
-        log(f"  [leaders] {full_name} → {'OK' if ok else 'NEULOŽENO'} (hidden={hid_val or '∅'}, visible={vis_val or '∅'})")
+        ok = bool(hid_val) and (vis_val.strip() == wanted)
+        log(f"  [leaders] '{wanted}' → {'OK' if ok else 'NEULOŽENO'} (hidden={hid_val or '∅'}, visible={vis_val or '∅'})")
         return ok
 
     _ensure_only_from_club()
-    ok_home = _pick("input[name='id_domaci_vedoucitext']",
-                    "input[name='id_domaci_vedouciid']",
-                    home_name)
-    ok_away = _pick("input[name='id_hoste_vedoucitext']",
-                    "input[name='id_hoste_vedouciid']",
-                    away_name)
+    ok_home = _pick_exact("input[name='id_domaci_vedoucitext']",
+                          "input[name='id_domaci_vedouciid']",
+                          home_name_text)
+    ok_away = _pick_exact("input[name='id_hoste_vedoucitext']",
+                          "input[name='id_hoste_vedouciid']",
+                          away_name_text)
     return ok_home and ok_away
+
 
 
 def fill_playroom(page, wanted_text: str, log):
