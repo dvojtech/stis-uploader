@@ -199,12 +199,8 @@ def _diag_dump_cell(page, target, tag, log):
 def _fill_player_by_click(page, selector, name, log):
     """
     Aktivuje buňku hráče a vybere jméno přes autocomplete.
-    - Zkouší více typů kliků (click/dblclick/JS/coords) na .player-name, .player i celou buňku.
-    - Píše „skutečnými klávesami“ a vynutí DOM události (input/keyup).
-    - Když se menu neukáže, zkusí jQuery UI search; jinak ArrowDown+Enter jako fallback.
-    - Vše podrobně loguje; při selhání ukládá diag (screenshot + HTML snippet).
+    DŮLEŽITÉ: input hledáme POUZE uvnitř buňky a nikdy nepíšeme do setů.
     """
-    # --- bezpečnostní fallbacky pro timeouty ---
     MENU_MS  = globals().get("FAST_MENU_MS", 1800)
     CLICK_MS = globals().get("FAST_CLICK_MS", 800)
 
@@ -212,14 +208,12 @@ def _fill_player_by_click(page, selector, name, log):
     if not name:
         return
 
-    # 0) odvoď "buňku" z dodaného selektoru (přijímáme buď buňku, nebo .player.domaci/host/.player-name)
+    # --- odvoď selektor buňky z dodaného selectoru ---
     cell_sel = None
     try:
         if " .cell-player:first-child" in selector or " .cell-player:last-child" in selector:
-            # už je to buňka → ořež event. ocas ".player …"
             cell_sel = selector.split(" .player", 1)[0]
         elif "#d" in selector:
-            # singly byly dřív zadané přes .player.domaci/.host → přemapuj na buňku
             if ".player.domaci " in selector:
                 cell_sel = selector.split(" .player", 1)[0].replace(".player.domaci", ".cell-player:first-child")
             if ".player.host " in selector:
@@ -232,76 +226,69 @@ def _fill_player_by_click(page, selector, name, log):
         log(f"  ✗ {name} → Nenalezen element: {cell_sel or selector}")
         return
 
-    # 1) DIAG: co je v buňce před
+    # DIAG před
     try:
-        before_txt = (cell.inner_text() or "").strip()
-        log(f"  → {name!r} @ {cell_sel or selector}  [before='{before_txt}']")
-    except Exception as _e:
-        log(f"  → {name!r} @ {cell_sel or selector}  [before=? {type(_e).__name__}]")
+        log(f"  → {name!r} @ {cell_sel or selector}  [before='{(cell.inner_text() or '').strip()}']")
+    except Exception:
+        pass
 
-    # 2) kandidáti pro klik (nejdřív vnitřní label, pak kontejner .player, nakonec celá buňka)
+    # Kandidáti pro klik
     click_targets = [
         cell.locator(".player .player-name").first,
         cell.locator(".player").first,
-        cell,  # fallback: celá buňka
+        cell,  # fallback
     ]
 
-    def find_any_input():
-        # 1) v buňce
-        loc = cell.locator("input.ui-autocomplete-input, input.ac_input, input[type='text']").first
+    # === KLÍČOVÁ OPRAVA: hledáme input POUZE v buňce a vyloučíme sety ===
+    def find_player_input_in_cell():
+        # jQuery UI autocomplete inputy
+        loc = cell.locator("input.ui-autocomplete-input, input.ac_input").first
         if loc.count():
             return loc
-        # 2) v oblasti formuláře
-        loc = page.locator("#zapis input.ui-autocomplete-input:visible, #zapis input.ac_input:visible, #zapis input[type='text']:visible").first
+        # poslední možnost: text input v buňce, ale NE .zapas-set / NE name^=set
+        loc = cell.locator("input[type='text']:not(.zapas-set):not([name^='set'])").first
         if loc.count():
             return loc
-        # 3) globálně
-        return page.locator("input.ui-autocomplete-input:visible, input.ac_input:visible, input[type='text']:visible").first
+        return None  # nikdy nebrat žádný globální input (mohl by to být set)
 
     def try_activation(tgt):
-        # různými způsoby: click → dblclick → JS dispatch → coords
         try:
             try: tgt.scroll_into_view_if_needed(timeout=CLICK_MS)
             except Exception: pass
 
-            # click
             tgt.click(timeout=CLICK_MS, force=True)
             page.wait_for_timeout(140)
-            inp = find_any_input()
-            if inp.count():
+            inp = find_player_input_in_cell()
+            if inp:
                 return "click", inp
 
-            # dblclick
             tgt.dblclick(timeout=CLICK_MS)
             page.wait_for_timeout(140)
-            inp = find_any_input()
-            if inp.count():
+            inp = find_player_input_in_cell()
+            if inp:
                 return "dblclick", inp
 
-            # JS dispatch
             try:
                 tgt.evaluate("""el => el.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}))""")
             except Exception:
                 pass
             page.wait_for_timeout(140)
-            inp = find_any_input()
-            if inp.count():
+            inp = find_player_input_in_cell()
+            if inp:
                 return "dispatch", inp
 
-            # coords click (střed elementu)
             box = tgt.bounding_box()
             if box:
                 page.mouse.click(box["x"] + box["width"]/2, box["y"] + box["height"]/2)
                 page.wait_for_timeout(160)
-                inp = find_any_input()
-                if inp.count():
+                inp = find_player_input_in_cell()
+                if inp:
                     return "coords", inp
 
             return None, None
         except Exception:
             return None, None
 
-    # 3) aktivace buňky → získat input
     ac_input = None
     how = None
     for tgt in click_targets:
@@ -312,28 +299,23 @@ def _fill_player_by_click(page, selector, name, log):
             break
 
     if not ac_input:
-        log(f"  ✗ {name} → žádný input po aktivaci ({cell_sel or selector})")
+        log(f"  ✗ {name} → žádný hráčský input po aktivaci ({cell_sel or selector})")
         _diag_dump_cell(page, cell, f"noinput_{_norm_name(name)}", log)
         return
     else:
-        log(f"  aktivace OK ({how}); input získán")
+        log(f"  aktivace OK ({how}); player input získán")
 
-    # 4) napsat jméno „skutečně“ + vynutit DOM události
+    # psát do nalezeného hráčského inputu (NE přes page.keyboard do activeElementu)
     try:
-        try: ac_input.fill("")  # vymazat
+        try: ac_input.fill("")
         except Exception: pass
-        try: ac_input.focus()
-        except Exception: pass
+        ac_input.focus()
+        ac_input.type(name, delay=25)  # typuj do konkrétního inputu
 
-        # psát na úrovni stránky – některé UI poslouchají jen tohle
-        page.keyboard.type(name, delay=35)
-
-        # vynutit události (pro jQuery UI a podobné)
+        # vynutit DOM události (kdyby UI poslouchalo jen na input/keyup)
         try:
             ac_input.evaluate("""
                 el => {
-                  const v = el.value;
-                  el.value = v;
                   el.dispatchEvent(new Event('input', {bubbles:true}));
                   el.dispatchEvent(new KeyboardEvent('keyup', {key:' ', bubbles:true}));
                 }
@@ -341,11 +323,11 @@ def _fill_player_by_click(page, selector, name, log):
         except Exception:
             pass
     except Exception as e:
-        log(f"  ✗ {name} → zápis do inputu selhal: {e!r}")
+        log(f"  ✗ {name} → zápis do hráčského inputu selhal: {e!r}")
         _diag_dump_cell(page, cell, f"typefail_{_norm_name(name)}", log)
         return
 
-    # 5) pokus o menu (širší selektor), případně explicitní jQuery search
+    # čekej menu (širší selektor)
     menu_sel = "ul.ui-autocomplete:visible, .ui-autocomplete.ui-menu:visible"
     menu = None
     try:
@@ -357,7 +339,7 @@ def _fill_player_by_click(page, selector, name, log):
             raw = (menu.nth(i).inner_text() or "").strip()
             log(f"    menu[{i}]={_strip_menu_text(raw)!r}")
     except Exception:
-        log("  menu NOT visible (po psaní + input/keyup) – zkusím jQuery UI search")
+        log("  menu NOT visible – zkusím jQuery UI search")
         try:
             ac_input.evaluate("""el => { if (window.jQuery && jQuery.fn.autocomplete) { jQuery(el).autocomplete('search', el.value || ''); } }""")
             page.wait_for_selector(menu_sel, timeout=MENU_MS)
@@ -368,23 +350,13 @@ def _fill_player_by_click(page, selector, name, log):
                 raw = (menu.nth(i).inner_text() or "").strip()
                 log(f"    menu[{i}]={_strip_menu_text(raw)!r}")
         except Exception:
-            log("  menu NOT visible ani po jQuery search → ArrowDown+Enter fallback")
-            page.keyboard.press("ArrowDown")
-            page.keyboard.press("Enter")
-            shown = (cell.inner_text() or "").strip()
-            if shown and shown != "----":
-                if any(_norm_name(shown) == _norm_name(v) for v in _name_variants(name)):
-                    log(f"  ✓ {name} → {cell_sel or selector} (exact)  [after='{shown}']")
-                else:
-                    log(f"  ~ {name} → {cell_sel or selector} vybráno, ale zobrazeno '{shown}'")
-            else:
-                log(f"  ⚠ {name} → žádná změna v buňce (stále '{shown or ''}')")
-                _diag_dump_cell(page, cell, f"nochange_{_norm_name(name)}", log)
-            return  # konec – fallback už proběhl
+            log("  menu NOT visible ani po jQuery search → bezpečný konec (nepíšu do setů)")
+            _diag_dump_cell(page, cell, f"nochange_{_norm_name(name)}", log)
+            return
 
-    # 6) výběr položky z menu (přesná shoda; když nic, tak příjmení a split-varianty)
+    # výběr z menu
     pick = -1
-    if menu and menu.count() > 0:
+    if menu and menu.count():
         want_norms = {_norm_name(v) for v in _name_variants(name)}
         n = min(menu.count(), 20)
         for i in range(n):
@@ -393,18 +365,12 @@ def _fill_player_by_click(page, selector, name, log):
                 pick = i
                 break
 
-        # zkusit ještě čisté příjmení, pokud přesná shoda nevyšla
         if pick < 0 and " " in name:
+            # fallback: zkus čisté příjmení
             surname = name.split()[-1]
-            try:
-                ac_input.fill("")
-            except Exception:
-                pass
-            try:
-                ac_input.focus()
-            except Exception:
-                pass
-            page.keyboard.type(surname, delay=35)
+            try: ac_input.fill("")
+            except Exception: pass
+            ac_input.focus(); ac_input.type(surname, delay=25)
             try:
                 page.wait_for_selector(menu_sel, timeout=MENU_MS)
                 menu = page.locator(menu_sel).first.locator("li")
@@ -425,11 +391,11 @@ def _fill_player_by_click(page, selector, name, log):
         if pick >= 0:
             menu.nth(pick).click(timeout=CLICK_MS)
         else:
-            log("  přesná shoda nenačtena → ArrowDown+Enter fallback")
-            page.keyboard.press("ArrowDown")
-            page.keyboard.press("Enter")
+            log("  přesná shoda nenačtena – ukončuji bez zápisu do setů")
+            _diag_dump_cell(page, cell, f"nochange_{_norm_name(name)}", log)
+            return
 
-    # 7) kontrola po akci + případný diag
+    # kontrola po akci
     try:
         after_txt = (cell.inner_text() or "").strip()
         if after_txt and after_txt != "----":
@@ -442,6 +408,7 @@ def _fill_player_by_click(page, selector, name, log):
             _diag_dump_cell(page, cell, f"nochange_{_norm_name(name)}", log)
     except Exception:
         pass
+
 
 
 def _fill_sets_by_event_index(page, event_index, sets, log):
